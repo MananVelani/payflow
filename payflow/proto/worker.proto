@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package payflow.worker.v1;
+option go_package = "payflow/proto/worker";
+
+service WorkerManagement {
+    rpc RegisterWorker(RegisterRequest) returns (RegisterResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    rpc PollTasks(PollRequest) returns (stream TaskAssignment);
+    rpc ReportResult(TaskResult) returns (ResultAck);
+}
+
+message RegisterRequest {
+    int64 epoch = 1;
+    string worker_id = 2;
+    int32 processing_capacity = 3;
+    
+    reserved 4 to 10;
+}
+
+message RegisterResponse {
+    bool success = 1;
+}
+
+message HeartbeatRequest {
+    int64 epoch = 1;
+    string worker_id = 2;
+    int32 current_load = 3; 
+    int32 tasks_processed_count = 4;
+    int32 avg_task_duration_ms = 5; 
+}
+
+message HeartbeatResponse {
+    bool acknowledged = 1;
+}
+
+message PollRequest {
+    string worker_id = 2;
+}
+
+message TaskAssignment {
+    int64 epoch = 1;
+    string task_id = 2;
+    string idempotency_key = 3;
+    double amount = 4;
+}
+
+message TaskResult {
+    int64 epoch = 1;
+    string task_id = 2;
+    string worker_id = 3;
+    
+    oneof status {
+        bool success = 4;
+        string error_message = 5;
+    }
+}
+
+message ResultAck {
+    bool acknowledged = 1;
+}
