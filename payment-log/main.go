@@ -29,6 +29,9 @@ func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.Appe
 }
 
 func main() {
+	// ✅ FIX: move here
+	store := NewStore()
+
 	lis, err := net.Listen("tcp", ":50054")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
