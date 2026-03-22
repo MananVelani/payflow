@@ -12,10 +12,15 @@ import (
 
 type LogServer struct {
 	pb.UnimplementedPaymentLogServiceServer
+	store *Store
 }
 
 func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.AppendResponse, error) {
-	log.Println("Received txn:", req.TxnId)
+
+	log.Println("Saving txn:", req.TxnId)
+
+	// Save to DB
+	s.store.Save(req.TxnId, req)
 
 	return &pb.AppendResponse{
 		LogIndex: 1,
@@ -31,7 +36,9 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 
-	pb.RegisterPaymentLogServiceServer(grpcServer, &LogServer{})
+	pb.RegisterPaymentLogServiceServer(grpcServer, &LogServer{
+		store: store,
+	})
 
 	log.Println("C4 Payment Log running on :50054")
 
