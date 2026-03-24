@@ -36,7 +36,7 @@ type CoordinatorNode struct {
 	ID      string
 	State   string
 	Epoch   int
-	Workers map[string]bool
+	Workers map[string]time.Time
 
 	leaderTimeout	time.Duration
 	resetTimer		chan bool
@@ -173,7 +173,7 @@ func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.Regi
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.Workers[req.WorkerId] = true
+	c.Workers[req.WorkerId] = time.Now()
 	log.Printf("[LEADER %s] Registered worker: %s", c.ID, req.WorkerId)
 
 	return &workerPb.RegisterResponse{
@@ -185,10 +185,17 @@ func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.Regi
 
 // Heartbeat receives periodic health checks from workers 
 func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.HeartbeatRequest) (*workerPb.HeartbeatResponse, error) {
-	// In Week 2, we will use this to reset a timeout timer. 
-	// For now, just log it.
-	log.Printf("[LEADER %s] Received heartbeat from worker %s. Load: %d", c.ID, req.WorkerId, req.CurrentLoad)
-	
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.State == "LEADER" {
+		_, exists := c.Workers[req.WorkerId]
+		if !exists {
+			log.Printf("[LEADER %s] 👋 New worker joined the pool: %s", c.ID, req.WorkerId)
+		}
+		c.Workers[req.WorkerId] = time.Now() // Update last seen timestamp
+	}
+
 	return &workerPb.HeartbeatResponse{
 		Acknowledged: true,
 	}, nil
@@ -275,6 +282,7 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 		// stream.Send() pushes the data down the open TCP connection
 		if err := stream.Send(task); err != nil {
 			log.Printf("Failed to send task to worker %s: %v", req.WorkerId, err)
+			c.TaskQueue <- task // Re-enqueue the task for another worker to pick up
 			return err
 		}
 	}
@@ -446,6 +454,39 @@ func (c *CoordinatorNode) broadcastCoordinator() {
 	}
 }
 
+// startWorkerMonitor sweeps the worker pool to detect crashed containers
+func (c *CoordinatorNode) startWorkerMonitor() {
+	log.Printf("[LEADER %s] 🕵️ Starting worker heartbeat monitor...", c.ID)
+	
+	for {
+		c.mu.Lock()
+		state := c.State
+		c.mu.Unlock()
+
+		if state != "LEADER" {
+			log.Printf("[Node %s] Stepped down. Stopping worker monitor.", c.ID)
+			return 
+		}
+
+		c.mu.Lock()
+		now := time.Now()
+		
+		for workerID, lastSeen := range c.Workers {
+			// If it has been more than 6 seconds since their last ping...
+			if now.Sub(lastSeen) > 6*time.Second {
+				log.Printf("[LEADER %s] 💀 Worker %s missed 3 heartbeats! Marking as DEAD.", c.ID, workerID)
+				
+				delete(c.Workers, workerID)
+				
+				log.Printf("[LEADER %s] TODO: Reassign incomplete tasks for %s", c.ID, workerID)
+			}
+		}
+		c.mu.Unlock()
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // becomeLeader locks in the victory and changes the state
 func (c *CoordinatorNode) becomeLeader() {
 	c.mu.Lock()
@@ -458,6 +499,7 @@ func (c *CoordinatorNode) becomeLeader() {
 	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
 
 	go c.startLeaderHeartbeat()
+	go c.startWorkerMonitor()
 }
 
 func main() {
@@ -469,7 +511,7 @@ func main() {
 		ID:      *idFlag,
 		State:   "FOLLOWER",
 		Epoch:   1,
-		Workers: make(map[string]bool),
+		Workers: make(map[string]time.Time),
 		leaderTimeout: 5 * time.Second,
 		resetTimer: make(chan bool, 1),
 		TaskQueue:	make(chan *workerPb.TaskAssignment, 100),
