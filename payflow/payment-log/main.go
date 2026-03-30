@@ -28,6 +28,26 @@ func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.Appe
 	}, nil
 }
 
+func (s *LogServer) CheckIdempotency(ctx context.Context, req *pb.IdempotencyRequest) (*pb.IdempotencyResponse, error) {
+
+	exists, txnID, success := s.store.CheckIdempotency(req.IdempotencyKey)
+
+	return &pb.IdempotencyResponse{
+		Exists:  exists,
+		TxnId:   txnID,
+		Success: success,
+	}, nil
+}
+
+func (s *LogServer) WriteResult(ctx context.Context, req *pb.WriteResultRequest) (*pb.WriteResultAck, error) {
+
+	s.store.WriteResult(req.IdempotencyKey, req.TxnId, req.Success)
+
+	return &pb.WriteResultAck{
+		Acknowledged: true,
+	}, nil
+}
+
 func main() {
 	// ✅ FIX: move here
 	store := NewStore()
