@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -94,7 +93,7 @@ func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMes
 	}
 
 	return &coordPb.ElectionResponse{
-		Epoch: int64(c.Epoch),
+		Epoch: currentEpoch,
 		Ok:    true,
 	}, nil
 }
@@ -168,17 +167,21 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 	txnID := "txn-" + uuid.New().String()
 
 	payloadMap := map[string]interface{}{
-		"amount":   req.Amount,
-		"merchant": req.MerchantId,
+		"amount":          req.Amount,
+		"merchant":        req.MerchantId,
 		"idempotency_key": req.IdempotencyKey,
 	}
-	payloadBytes, _ := json.Marshal(payloadMap) // Automatically escapes bad characters
+	payloadBytes, err := json.Marshal(payloadMap) // Automatically escapes bad characters
+	if err != nil {
+		log.Printf("[LEADER %s] JSON Marshal failed: %v", c.ID, err)
+		return nil, status.Errorf(codes.Internal, "failed to encode task payload")
+	}
 	safePayload := string(payloadBytes)
 
 	// 3. --- FORWARD TO C4 (Payment Log Service) ---
 	// CRITICAL FIX: Use persistent connection & enforce data durability
 	if c.c4Client == nil {
-		log.Printf("[LEADER %s] ⚠️ Cannot write to C4: Persistent client is nil", c.ID)
+		log.Printf("[LEADER %s] Cannot write to C4: Persistent client is nil", c.ID)
 		return nil, status.Errorf(codes.Internal, "internal server error: C4 client not initialized")
 	}
 
@@ -190,7 +193,7 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 	})
 
 	if err != nil {
-		log.Printf("[LEADER %s] ⚠️ C4 AppendEntry failed: %v", c.ID, err)
+		log.Printf("[LEADER %s] C4 AppendEntry failed: %v", c.ID, err)
 		// CRITICAL FIX: Abort! Do not enqueue the task if WAL write fails.
 		return nil, status.Errorf(codes.Unavailable, "failed to persist task to WAL: %v", err)
 	}
@@ -228,14 +231,19 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.RegisterRequest) (*workerPb.RegisterResponse, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	isLeader := c.State == "LEADER"
+	c.mu.Unlock()
 
+	if !isLeader {
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader. cannot register workers", c.ID)
+	}
+
+	c.mu.Lock()
 	c.Workers[req.WorkerId] = time.Now()
-	log.Printf("[LEADER %s] Registered worker: %s", c.ID, req.WorkerId)
+	c.mu.Unlock()
 
-	return &workerPb.RegisterResponse{
-		Success: true,
-	}, nil
+	log.Printf("[LEADER %s] Registered worker: %s", c.ID, req.WorkerId)
+	return &workerPb.RegisterResponse{Success: true}, nil
 }
 
 // Heartbeat receives periodic health checks from workers
@@ -286,10 +294,10 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	c.mu.Unlock()
 
 	if !isLeader {
-		return nil, fmt.Errorf("I am not the leader. Please route to the current leader")
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader", c.ID)
 	}
 
-	log.Printf("[LEADER %s] Worker %s started polling for tasks", c.ID, req.WorkerId)
+	log.Printf("[LEADER %s] Processing task result for %s from worker %s", c.ID, req.TaskId, req.WorkerId)
 
 	// 1. Determine if the worker succeeded or failed
 	isSuccess := req.GetSuccess()
@@ -300,24 +308,22 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	}
 
 	// 2. --- FORWARD RESULT TO C4 (Payment Log Service) ---
-	conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("[LEADER %s] Failed to connect to Payment Log Service to record result: %v", c.ID, err)
-	} else {
-		defer conn.Close()
-		logClient := logPb.NewPaymentLogServiceClient(conn)
-
-		// Call the WriteResult RPC defined in log.proto
-		_, err := logClient.WriteResult(ctx, &logPb.WriteResultRequest{
+	// FIX: Removed the Dial/NewClient block to prevent connection exhaustion
+	if c.c4Client != nil {
+		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
 			TxnId:   req.TaskId,
 			Success: isSuccess,
+			// FIX: Uncomment this once you've added the field to worker.proto
+			// IdempotencyKey: req.GetIdempotencyKey(),
 		})
 
 		if err != nil {
-			log.Printf("[LEADER %s] C4 WriteResult failed: %v", c.ID, err)
+			log.Printf("[LEADER %s] ⚠️ C4 WriteResult failed for task %s: %v", c.ID, req.TaskId, err)
 		} else {
-			log.Printf("[LEADER %s] Permanently recorded task %s outcome to C4 database.", c.ID, req.TaskId)
+			log.Printf("[LEADER %s] Permanently recorded task %s outcome to C4.", c.ID, req.TaskId)
 		}
+	} else {
+		log.Printf("[LEADER %s] ⚠️ Skip C4 update: Persistent client is nil", c.ID)
 	}
 
 	// 3. Acknowledge the worker
@@ -570,9 +576,15 @@ func main() {
 	flag.Parse() // Parse the flags from the terminal
 
 	log.Printf("Booting up node %s... Connecting to C4 Database...", *idFlag)
+	var c4Client logPb.PaymentLogServiceClient // Declare variable
 	c4Conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
+
 	if err != nil {
-		log.Printf("⚠️ Warning: Could not connect to C4 at startup: %v", err)
+		log.Printf("Warning: Could not connect to C4 at startup: %v", err)
+		c4Client = nil // Will check for nil before every C4 operation
+	} else {
+		log.Printf("Established persistent connection to C4")
+		c4Client = logPb.NewPaymentLogServiceClient(c4Conn)
 	}
 
 	node := &CoordinatorNode{
@@ -583,7 +595,7 @@ func main() {
 		leaderTimeout: 5 * time.Second,
 		resetTimer:    make(chan bool, 1),
 		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
-		c4Client:      logPb.NewPaymentLogServiceClient(c4Conn),
+		c4Client:      c4Client,
 	}
 
 	node.StartLeaderMonitor()
