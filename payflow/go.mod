@@ -3,12 +3,12 @@ module payflow
 go 1.26.1
 
 require (
+	go.etcd.io/bbolt v1.4.3
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
 
 require (
-	go.etcd.io/bbolt v1.4.3 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
