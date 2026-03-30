@@ -5,14 +5,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"log"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	coordPb "payflow/proto/coordinator"
 	logPb "payflow/proto/log"
@@ -48,6 +50,8 @@ type CoordinatorNode struct {
 	TaskQueue chan *workerPb.TaskAssignment
 
 	mu sync.Mutex
+
+	c4Client logPb.PaymentLogServiceClient
 }
 
 // ---------------------------------------------------------
@@ -160,48 +164,54 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 	log.Printf("[LEADER %s] Received task for amount: %f", c.ID, req.Amount)
 
-	// 2. Generate a dynamic Transaction ID
-	txnID := "txn-" + fmt.Sprintf("%d", time.Now().UnixMilli())
+	// 2. Generate a dynamic Transaction ID (CRITICAL FIX: UUID prevents collisions)
+	txnID := "txn-" + uuid.New().String()
 
 	payloadMap := map[string]interface{}{
 		"amount":   req.Amount,
 		"merchant": req.MerchantId,
+		"idempotency_key": req.IdempotencyKey,
 	}
 	payloadBytes, _ := json.Marshal(payloadMap) // Automatically escapes bad characters
 	safePayload := string(payloadBytes)
 
 	// 3. --- FORWARD TO C4 (Payment Log Service) ---
-	conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Failed to connect to Payment Log Service: %v", err)
-	} else {
-		defer conn.Close()
-		logClient := logPb.NewPaymentLogServiceClient(conn)
-
-		logRes, err := logClient.AppendEntry(ctx, &logPb.LogEntry{
-			Epoch:   int64(c.Epoch),
-			TxnId:   txnID,
-			State:   "QUEUED",
-			Payload: safePayload,
-		})
-
-		if err != nil {
-			log.Printf("C4 AppendEntry failed: %v", err)
-		} else {
-			log.Printf("Successfully wrote to C4 log! Index: %d", logRes.LogIndex)
-		}
+	// CRITICAL FIX: Use persistent connection & enforce data durability
+	if c.c4Client == nil {
+		log.Printf("[LEADER %s] ⚠️ Cannot write to C4: Persistent client is nil", c.ID)
+		return nil, status.Errorf(codes.Internal, "internal server error: C4 client not initialized")
 	}
+
+	logRes, err := c.c4Client.AppendEntry(ctx, &logPb.LogEntry{
+		Epoch:   c.Epoch, // Assumes you changed the struct field to int64
+		TxnId:   txnID,
+		State:   "QUEUED",
+		Payload: safePayload,
+	})
+
+	if err != nil {
+		log.Printf("[LEADER %s] ⚠️ C4 AppendEntry failed: %v", c.ID, err)
+		// CRITICAL FIX: Abort! Do not enqueue the task if WAL write fails.
+		return nil, status.Errorf(codes.Unavailable, "failed to persist task to WAL: %v", err)
+	}
+
+	log.Printf("[LEADER %s] Successfully wrote to C4 log! Index: %d", c.ID, logRes.LogIndex)
 
 	// 4. --- PUSH TO WORKER QUEUE ---
 	newTask := &workerPb.TaskAssignment{
-		Epoch:          int64(c.Epoch),
+		Epoch:          c.Epoch, // Assumes you changed the struct field to int64
 		TaskId:         txnID,
 		IdempotencyKey: req.IdempotencyKey,
 		Amount:         req.Amount,
 	}
 
-	c.TaskQueue <- newTask
-	log.Printf("[LEADER %s] Task %s added to queue. Queue size: %d", c.ID, newTask.TaskId, len(c.TaskQueue))
+	select {
+	case c.TaskQueue <- newTask:
+		log.Printf("[LEADER %s] Task %s added to queue. Queue size: %d", c.ID, newTask.TaskId, len(c.TaskQueue))
+	case <-ctx.Done():
+		// If the request is canceled or times out before the queue frees up, fail gracefully
+		return nil, status.Errorf(codes.DeadlineExceeded, "task queue is full or request canceled")
+	}
 
 	// 5. Return success to the Gateway
 	return &paymentPb.SubmitTaskResponse{
@@ -332,10 +342,18 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 	for task := range c.TaskQueue {
 		log.Printf("[LEADER %s] Dispatching task %s to worker %s", c.ID, task.TaskId, req.WorkerId)
 
-		// stream.Send() pushes the data down the open TCP connection
-		if err := stream.Send(task); err != nil {
-			log.Printf("Failed to send task to worker %s: %v", req.WorkerId, err)
-			c.TaskQueue <- task // Re-enqueue the task for another worker to pick up
+		err := stream.Send(task)
+		if err != nil {
+			log.Printf("[LEADER %s] Failed to send task %s to worker %s: %v", c.ID, task.TaskId, req.WorkerId, err)
+
+			// stream.Send() pushes the data down the open TCP connection
+			select {
+			case c.TaskQueue <- task:
+				log.Printf("[LEADER %s] Successfully re-enqueued task %s", c.ID, task.TaskId)
+			default:
+				// If the queue is totally full, we log the failure instead of deadlocking the loop
+				log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
+			}
 			return err
 		}
 	}
@@ -397,16 +415,19 @@ func (c *CoordinatorNode) triggerElection() {
 func (c *CoordinatorNode) broadcastElection() {
 	higherNodes := make(map[string]string)
 
+	myNumericID := parseNodeID(c.ID)
+
 	// 1. Find nodes with a strictly higher ID string
 	for id, addr := range clusterPeers {
-		if id > c.ID {
+		peerNumericID := parseNodeID(id)
+		if peerNumericID > myNumericID {
 			higherNodes[id] = addr
 		}
 	}
 
 	// 2. Base Case: If there are no higher nodes, we win instantly!
 	if len(higherNodes) == 0 {
-		log.Printf("[Node %s] I have the highest ID. I win the election instantly!", c.ID)
+		log.Printf("[Node %s] possessing highest ID, election won!", c.ID)
 		c.becomeLeader()
 		return
 	}
@@ -548,6 +569,12 @@ func main() {
 	portFlag := flag.String("port", ":50051", "The port to run the gRPC server on")
 	flag.Parse() // Parse the flags from the terminal
 
+	log.Printf("Booting up node %s... Connecting to C4 Database...", *idFlag)
+	c4Conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("⚠️ Warning: Could not connect to C4 at startup: %v", err)
+	}
+
 	node := &CoordinatorNode{
 		ID:            *idFlag,
 		State:         "FOLLOWER",
@@ -556,6 +583,7 @@ func main() {
 		leaderTimeout: 5 * time.Second,
 		resetTimer:    make(chan bool, 1),
 		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
+		c4Client:      logPb.NewPaymentLogServiceClient(c4Conn),
 	}
 
 	node.StartLeaderMonitor()
