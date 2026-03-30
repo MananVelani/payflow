@@ -2,24 +2,28 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
-	"log"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"log"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	coordPb "payflow/proto/coordinator"
+	logPb "payflow/proto/log"
 	paymentPb "payflow/proto/payment"
 	workerPb "payflow/proto/worker"
-	logPb "payflow/proto/log"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 )
 
-// Hardcoded cluster addresses for local testing
 // Hardcoded cluster addresses for local IPv4 testing
 var clusterPeers = map[string]string{
 	"coordinator-1": "127.0.0.1:50051",
@@ -35,26 +39,54 @@ type CoordinatorNode struct {
 
 	ID      string
 	State   string
-	Epoch   int
+	Epoch   int64
 	Workers map[string]time.Time
 
-	leaderTimeout	time.Duration
-	resetTimer		chan bool
+	leaderTimeout time.Duration
+	resetTimer    chan bool
 
-	TaskQueue		chan *workerPb.TaskAssignment
+	TaskQueue chan *workerPb.TaskAssignment
 
-	mu      sync.Mutex
+	mu sync.Mutex
 }
 
 // ---------------------------------------------------------
 // 1. COORDINATOR CLUSTER SERVICE (Bully Algorithm)
 // ---------------------------------------------------------
 
+func parseNodeID(id string) int {
+	parts := strings.Split(id, "-")
+	if len(parts) == 2 {
+		num, err := strconv.Atoi(parts[1])
+		if err == nil {
+			return num
+		}
+	}
+	return 0 // Fallback if parsing fails
+}
+
 func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMessage) (*coordPb.ElectionResponse, error) {
+	c.mu.Lock()
+	currentEpoch := c.Epoch
+	c.mu.Unlock()
+
+	// CRITICAL FIX 1: Ignore stale election requests from older epochs
+	if req.Epoch < currentEpoch {
+		log.Printf("[Node %s] Rejecting stale ELECTION from %s (Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, currentEpoch)
+		return &coordPb.ElectionResponse{
+			Epoch: currentEpoch,
+			Ok:    false, // Do not agree to the election!
+		}, nil
+	}
+
 	log.Printf("[Node %s] Received ELECTION from %s with epoch %d", c.ID, req.CandidateId, req.Epoch)
 
-	if req.CandidateId < c.ID {
-		go c.triggerElection() // Step down and start our own election if we have a higher ID
+	// CRITICAL FIX 2: Mathematical ID comparison instead of string comparison
+	myID := parseNodeID(c.ID)
+	candidateID := parseNodeID(req.CandidateId)
+
+	if candidateID < myID {
+		go c.triggerElection() // Step down and start our own election to crush them
 	}
 
 	return &coordPb.ElectionResponse{
@@ -68,35 +100,43 @@ func (c *CoordinatorNode) AnnounceCoordinator(ctx context.Context, req *coordPb.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// log.Printf("[Node %s] Received COORDINATOR announcement from %s for Epoch %d", c.ID, req.LeaderId, req.Epoch)
-
-	if c.State != "FOLLOWER" || int(req.Epoch) > c.Epoch {
-		log.Printf(("[Node %s] Bending knee  to Leader %s for Epoch %d") , c.ID, req.LeaderId, req.Epoch)
-	}
-
-	if req.LeaderId < c.ID {
-		log.Printf("[Node %s] 😤 Leader %s is smaller than me! Initiating takeover...", c.ID, req.LeaderId)
-		// We launch this in a goroutine so we don't block the current request
-		go c.triggerElection()
-		
+	if req.Epoch < c.Epoch {
+		log.Printf("[Node %s] Ignoring stale COORDINATOR announcement from %s (Epoch %d < %d)", c.ID, req.LeaderId, req.Epoch, c.Epoch)
 		return &coordPb.AckResponse{
-			Acknowledged: false, // Do NOT bend the knee!
+			Acknowledged: false,
 		}, nil
 	}
-	
+
+	if c.State != "FOLLOWER" || req.Epoch > c.Epoch {
+		log.Printf(("[Node %s] Acknowledging Leader %s for Epoch %d"), c.ID, req.LeaderId, req.Epoch)
+	}
+
+	myId := parseNodeID(c.ID)
+	leaderId := parseNodeID(req.LeaderId)
+
+	if leaderId < myId {
+		log.Printf("[Node %s] Rejecting leader %s (lower ID). Initiating election...", c.ID, req.LeaderId)
+		// We launch this in a goroutine so we don't block the current request
+		go c.triggerElection()
+
+		return &coordPb.AckResponse{
+			Acknowledged: false,
+		}, nil
+	}
+
 	// Step down and accept the new leader
 	c.State = "FOLLOWER"
-	
+
 	// Sync our epoch with the leader's epoch
-	if int(req.Epoch) > c.Epoch {
-		c.Epoch = int(req.Epoch)
+	if req.Epoch > c.Epoch {
+		c.Epoch = req.Epoch
 	}
-	
+
 	// Reset the timeout timer so we don't accidentally trigger another election
 	// (The non-blocking channel send we built earlier!)
 	select {
-		case c.resetTimer <- true:
-		default:
+	case c.resetTimer <- true:
+	default:
 	}
 
 	return &coordPb.AckResponse{
@@ -115,13 +155,20 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 	// 1. Only the LEADER is allowed to accept new tasks
 	if !isLeader {
-		return nil, fmt.Errorf("I am not the leader. Please route to the current leader")
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader. please route to the current leader", c.ID)
 	}
 
 	log.Printf("[LEADER %s] Received task for amount: %f", c.ID, req.Amount)
 
 	// 2. Generate a dynamic Transaction ID
 	txnID := "txn-" + fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	payloadMap := map[string]interface{}{
+		"amount":   req.Amount,
+		"merchant": req.MerchantId,
+	}
+	payloadBytes, _ := json.Marshal(payloadMap) // Automatically escapes bad characters
+	safePayload := string(payloadBytes)
 
 	// 3. --- FORWARD TO C4 (Payment Log Service) ---
 	conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -135,7 +182,7 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 			Epoch:   int64(c.Epoch),
 			TxnId:   txnID,
 			State:   "QUEUED",
-			Payload: fmt.Sprintf(`{"amount": %f, "merchant": "%s"}`, req.Amount, req.MerchantId),
+			Payload: safePayload,
 		})
 
 		if err != nil {
@@ -181,9 +228,7 @@ func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.Regi
 	}, nil
 }
 
-// Note: You will eventually need to implement Heartbeat, PollTasks, and ReportResult here too!
-
-// Heartbeat receives periodic health checks from workers 
+// Heartbeat receives periodic health checks from workers
 func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.HeartbeatRequest) (*workerPb.HeartbeatResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -191,7 +236,7 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 	if c.State == "LEADER" {
 		_, exists := c.Workers[req.WorkerId]
 		if !exists {
-			log.Printf("[LEADER %s] 👋 New worker joined the pool: %s", c.ID, req.WorkerId)
+			log.Printf("[LEADER %s] New worker joined the pool: %s", c.ID, req.WorkerId)
 		}
 		c.Workers[req.WorkerId] = time.Now() // Update last seen timestamp
 	}
@@ -203,8 +248,8 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 
 // startLeaderHeartbeat continuously suppresses follower elections
 func (c *CoordinatorNode) startLeaderHeartbeat() {
-	log.Printf("[LEADER %s] 🫀 Starting heartbeat broadcaster...", c.ID)
-	
+	log.Printf("[LEADER %s] Starting heartbeat broadcaster...", c.ID)
+
 	for {
 		c.mu.Lock()
 		state := c.State
@@ -213,7 +258,7 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 		// If we ever step down (e.g., a bigger node joins), kill this loop!
 		if state != "LEADER" {
 			log.Printf("[Node %s] No longer leader. Stopping heartbeats.", c.ID)
-			return 
+			return
 		}
 
 		// Broadcast our leadership to reset all follower timers
@@ -224,7 +269,6 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 	}
 }
 
-// ReportResult handles the outcome of a payment from a worker 
 // ReportResult handles the outcome of a payment from a worker
 func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskResult) (*workerPb.ResultAck, error) {
 	c.mu.Lock()
@@ -235,12 +279,14 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 		return nil, fmt.Errorf("I am not the leader. Please route to the current leader")
 	}
 
+	log.Printf("[LEADER %s] Worker %s started polling for tasks", c.ID, req.WorkerId)
+
 	// 1. Determine if the worker succeeded or failed
 	isSuccess := req.GetSuccess()
 	if !isSuccess {
-		log.Printf("[LEADER %s] ❌ Worker %s failed task %s. Error: %s", c.ID, req.WorkerId, req.TaskId, req.GetErrorMessage())
+		log.Printf("[LEADER %s] Worker %s failed task %s. Error: %s", c.ID, req.WorkerId, req.TaskId, req.GetErrorMessage())
 	} else {
-		log.Printf("[LEADER %s] ✅ Worker %s successfully completed task %s", c.ID, req.WorkerId, req.TaskId)
+		log.Printf("[LEADER %s] Worker %s successfully completed task %s", c.ID, req.WorkerId, req.TaskId)
 	}
 
 	// 2. --- FORWARD RESULT TO C4 (Payment Log Service) ---
@@ -270,15 +316,22 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	}, nil
 }
 
-// PollTasks is a SERVER STREAMING endpoint where the coordinator pushes tasks to the worker 
-// Notice there is no return object, only an error return.
+// PollTasks is a SERVER STREAMING endpoint where the coordinator pushes tasks to the worker
 func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.WorkerManagement_PollTasksServer) error {
+	c.mu.Lock()
+	isLeader := c.State == "LEADER"
+	c.mu.Unlock()
+
+	if !isLeader {
+		return status.Errorf(codes.FailedPrecondition, "node %s is not the leader. stream rejected", c.ID)
+	}
+
 	log.Printf("[LEADER %s] Worker %s started polling for tasks", c.ID, req.WorkerId)
-	
-	// For Week 1 Integration, we just send one dummy task and close the stream
+
+	// PollTasks keeps a persistent connection open to push tasks to workers.
 	for task := range c.TaskQueue {
 		log.Printf("[LEADER %s] Dispatching task %s to worker %s", c.ID, task.TaskId, req.WorkerId)
-		
+
 		// stream.Send() pushes the data down the open TCP connection
 		if err := stream.Send(task); err != nil {
 			log.Printf("Failed to send task to worker %s: %v", req.WorkerId, err)
@@ -286,10 +339,10 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 			return err
 		}
 	}
-	
+
 	// Returning nil tells gRPC "I am done streaming, you can close the connection"
-	// In Week 2, this will be an infinite loop listening to a Go channel!
-	return nil 
+	// Only errors are returned, returning nil means there is no error
+	return nil
 }
 
 // StartLeaderMonitor runs continuously in the background.
@@ -302,10 +355,10 @@ func (c *CoordinatorNode) StartLeaderMonitor() {
 			case <-timer.C:
 				// The timer hit 0. The leader is presumed DEAD.
 				c.triggerElection()
-				
+
 				// Reset the timer so we don't spam elections endlessly
 				timer.Reset(c.leaderTimeout)
-				
+
 			case <-c.resetTimer:
 				// We got a ping from the leader! Reset the countdown.
 				if !timer.Stop() {
@@ -331,20 +384,19 @@ func (c *CoordinatorNode) triggerElection() {
 		return
 	}
 
-	// Transition to CANDIDATE and increment our Epoch [cite: 174]
+	// Transition to CANDIDATE and increment our Epoch
 	c.State = "CANDIDATE"
-	c.Epoch++ 
-	
-	log.Printf("[Node %s] 🚨 Leader timeout! Transitioned to CANDIDATE for Epoch %d", c.ID, c.Epoch)
-	
-	// Next step: Broadcast ELECTION message to higher IDs!
+	c.Epoch++
+
+	log.Printf("[Node %s] Leader timeout! Transitioned to CANDIDATE for Epoch %d", c.ID, c.Epoch)
+
 	go c.broadcastElection()
 }
 
 // broadcastElection sends an ELECTION message to all nodes with a higher ID
 func (c *CoordinatorNode) broadcastElection() {
 	higherNodes := make(map[string]string)
-	
+
 	// 1. Find nodes with a strictly higher ID string
 	for id, addr := range clusterPeers {
 		if id > c.ID {
@@ -378,7 +430,7 @@ func (c *CoordinatorNode) broadcastElection() {
 			defer conn.Close()
 
 			client := coordPb.NewCoordinatorClusterClient(conn)
-			
+
 			res, err := client.Election(ctx, &coordPb.ElectionMessage{
 				Epoch:       int64(c.Epoch),
 				CandidateId: c.ID,
@@ -416,12 +468,10 @@ func (c *CoordinatorNode) broadcastElection() {
 
 // broadcastCoordinator tells all other nodes to bend the knee
 func (c *CoordinatorNode) broadcastCoordinator() {
-	// log.Printf("[LEADER %s] 👑 Announcing victory to the cluster for Epoch %d...", c.ID, c.Epoch)
-
 	for id, addr := range clusterPeers {
 		// Don't send the announcement to ourselves
 		if id == c.ID {
-			continue 
+			continue
 		}
 
 		// Fire off a concurrent gRPC call to each peer
@@ -436,28 +486,19 @@ func (c *CoordinatorNode) broadcastCoordinator() {
 			defer conn.Close()
 
 			client := coordPb.NewCoordinatorClusterClient(conn)
-			
+
 			_, err = client.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
 				Epoch:    int64(c.Epoch),
 				LeaderId: c.ID,
 			})
-
-			/*
-			if err == nil {
-				log.Printf("[LEADER %s] Node %s acknowledged our leadership.", c.ID, peerID)
-			} else {
-				// We added '%v' and 'err' here to expose the exact failure reason
-				log.Printf("[LEADER %s] Node %s unreachable during announcement: %v", c.ID, peerID, err)
-			}
-			*/
 		}(id, addr)
 	}
 }
 
 // startWorkerMonitor sweeps the worker pool to detect crashed containers
 func (c *CoordinatorNode) startWorkerMonitor() {
-	log.Printf("[LEADER %s] 🕵️ Starting worker heartbeat monitor...", c.ID)
-	
+	log.Printf("[LEADER %s] Starting worker heartbeat monitor...", c.ID)
+
 	for {
 		c.mu.Lock()
 		state := c.State
@@ -465,19 +506,19 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 
 		if state != "LEADER" {
 			log.Printf("[Node %s] Stepped down. Stopping worker monitor.", c.ID)
-			return 
+			return
 		}
 
 		c.mu.Lock()
 		now := time.Now()
-		
+
 		for workerID, lastSeen := range c.Workers {
 			// If it has been more than 6 seconds since their last ping...
 			if now.Sub(lastSeen) > 6*time.Second {
-				log.Printf("[LEADER %s] 💀 Worker %s missed 3 heartbeats! Marking as DEAD.", c.ID, workerID)
-				
+				log.Printf("[LEADER %s] Worker %s timeout (missed 3 heartbeats). Marking as DEAD.", c.ID, workerID)
+
 				delete(c.Workers, workerID)
-				
+
 				log.Printf("[LEADER %s] TODO: Reassign incomplete tasks for %s", c.ID, workerID)
 			}
 		}
@@ -492,10 +533,10 @@ func (c *CoordinatorNode) becomeLeader() {
 	c.mu.Lock()
 	c.State = "LEADER"
 	c.mu.Unlock()
-	
+
 	c.broadcastCoordinator()
 
-	log.Printf("[LEADER %s] 👑 Won the election! Operating in Epoch %d", c.ID, c.Epoch)
+	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, c.Epoch)
 	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
 
 	go c.startLeaderHeartbeat()
@@ -508,13 +549,13 @@ func main() {
 	flag.Parse() // Parse the flags from the terminal
 
 	node := &CoordinatorNode{
-		ID:      *idFlag,
-		State:   "FOLLOWER",
-		Epoch:   1,
-		Workers: make(map[string]time.Time),
+		ID:            *idFlag,
+		State:         "FOLLOWER",
+		Epoch:         int64(1),
+		Workers:       make(map[string]time.Time),
 		leaderTimeout: 5 * time.Second,
-		resetTimer: make(chan bool, 1),
-		TaskQueue:	make(chan *workerPb.TaskAssignment, 100),
+		resetTimer:    make(chan bool, 1),
+		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
 	}
 
 	node.StartLeaderMonitor()
