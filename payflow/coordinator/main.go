@@ -73,18 +73,23 @@ func parseNodeID(id string) int {
 
 func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMessage) (*coordPb.ElectionResponse, error) {
 	c.mu.Lock()
-	currentEpoch := c.Epoch
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
 	// CRITICAL FIX 1: Ignore stale election requests from older epochs
-	if req.Epoch < currentEpoch {
-		log.Printf("[Node %s] Rejecting stale ELECTION from %s (Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, currentEpoch)
+	if req.Epoch < c.Epoch {
+		log.Printf("[Node %s] Rejecting stale ELECTION from %s (Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, c.Epoch)
 		return &coordPb.ElectionResponse{
-			Epoch: currentEpoch,
+			Epoch: c.Epoch,
 			Ok:    false, // Do not agree to the election!
 		}, nil
 	}
 
+	if req.Epoch > c.Epoch {
+		log.Printf("[Node %s] Received higher epoch ELECTION from %s (Epoch %d > %d). Stepping down to FOLLOWER", c.ID, req.CandidateId, req.Epoch, c.Epoch)
+		c.Epoch = req.Epoch
+		c.State = "FOLLOWER"
+	}
+	
 	log.Printf("[Node %s] Received ELECTION from %s with epoch %d", c.ID, req.CandidateId, req.Epoch)
 
 	// CRITICAL FIX 2: Mathematical ID comparison instead of string comparison
@@ -96,7 +101,7 @@ func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMes
 	}
 
 	return &coordPb.ElectionResponse{
-		Epoch: currentEpoch,
+		Epoch: c.Epoch,
 		Ok:    true,
 	}, nil
 }
