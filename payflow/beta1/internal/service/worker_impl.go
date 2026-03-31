@@ -14,6 +14,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/outbox"
 	"github.com/your-org/payflow/worker/internal/concurrency"
+	"github.com/your-org/payflow/worker/internal/resilience"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
@@ -52,6 +53,9 @@ type WorkerServiceImpl struct {
 
 	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
 	wg *sync.WaitGroup
+
+	// --- WEEK 2 ADDITION: Resilience ---
+	circuitBreaker *resilience.BankCircuitBreaker
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -83,6 +87,9 @@ func NewWorkerServiceImpl(
 		sem:            sem,
 		taskRegistry:   registry,
 		wg:             wg,
+
+		// --- WEEK 2 ADDITION: Initialize circuit breaker ---
+		circuitBreaker: resilience.NewBankCircuitBreaker(logger),
 	}
 }
 
@@ -178,8 +185,22 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		return cachedResult, err
 	}
 
-	// ── STEP 3: Call Mock Bank ────────────────────────────────────────────
-	txnRef, err := w.bankClient.Charge(ctx, task.IdempotencyKey, task.Amount, task.Currency, task.MerchantID)
+	// ── STEP 3: Call Mock Bank (Resilient Path) ───────────────────────────
+	// --- WEEK 2 ADDITION: Resilience (Retry + Circuit Breaker) ---
+	var txnRef string
+	bankOp := func() error {
+		var chargeErr error
+		txnRef, chargeErr = w.bankClient.Charge(ctx, task.IdempotencyKey, task.Amount, task.Currency, task.MerchantID)
+		return chargeErr
+	}
+
+	// 1. Wrap in circuit breaker
+	_, err = w.circuitBreaker.Execute(func() (interface{}, error) {
+		// 2. Wrap in custom full-jitter retry engine
+		// Max 3 attempts, 100ms base delay
+		return nil, resilience.ExecuteWithRetry(ctx, bankOp, 3, 100*time.Millisecond)
+	})
+	// --- END WEEK 2 ADDITION ---
 	
 	result := &domain.PaymentResult{
 		TaskID:         task.TaskID,
