@@ -19,6 +19,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/outbox"
 	"github.com/your-org/payflow/worker/internal/concurrency"
+	"github.com/your-org/payflow/worker/internal/observability"
 	"github.com/your-org/payflow/worker/internal/service"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 	"sync"
@@ -108,11 +109,15 @@ func run() error {
 	var wg sync.WaitGroup // for task draining
 	// --- END WEEK 2 ADDITION ---
 
+	// --- WEEK 2 ADDITION: Observability ---
+	obsLog := observability.NewLogger(log)
+	// --- END WEEK 2 ADDITION ---
+
 	workerSvc := service.NewWorkerServiceImpl(
 		bankClient,
 		c4Client,
 		c2Client.ReportResult,
-		log,
+		obsLog, // WEEK 2: upgraded to contextual logger
 		cfg,
 		reservationMap, // WEEK 2 ADDITION
 		outboxBuf,      // WEEK 2 ADDITION

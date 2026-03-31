@@ -15,6 +15,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/outbox"
 	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/resilience"
+	"github.com/your-org/payflow/worker/internal/observability"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
@@ -24,8 +25,10 @@ type WorkerServiceImpl struct {
 	bankClient    BankClient
 	logClient     LogServiceClient
 	reportResult  ReportResultFunc
-	logger        *zap.Logger
+	// --- WEEK 2 ADDITION: Upgrade to contextual logger ---
+	logger        *observability.Logger
 	cfg           *config.Config
+	metrics       *observability.Metrics // WEEK 2 ADDITION
 
 	// Concurrency-safe revoke map
 	revokedTasks  sync.Map // key: task_id (string), value: true
@@ -63,7 +66,7 @@ func NewWorkerServiceImpl(
 	bankClient BankClient,
 	logClient LogServiceClient,
 	reportFn ReportResultFunc,
-	logger *zap.Logger,
+	logger *observability.Logger, // WEEK 2: upgraded
 	cfg *config.Config,
 	reservationMap *reservation.Map, // WEEK 2 ADDITION
 	outbox *outbox.Outbox,         // WEEK 2 ADDITION
@@ -77,11 +80,12 @@ func NewWorkerServiceImpl(
 		reportResult: reportFn,
 		logger:       logger,
 		cfg:          cfg,
+		metrics:      observability.NewMetrics(), // WEEK 2 ADDITION
 
 		// --- WEEK 2 ADDITION: Initialize fencing validator ---
 		epochValidator: fence.NewEpochValidator(),
 
-		// --- WEEK 2 ADDITION: Wire dependencies ---
+		// --- WEEK 2 ADDITION: Initialize dependencies ---
 		reservationMap: reservationMap,
 		outbox:         outbox,
 		sem:            sem,
@@ -89,7 +93,8 @@ func NewWorkerServiceImpl(
 		wg:             wg,
 
 		// --- WEEK 2 ADDITION: Initialize circuit breaker ---
-		circuitBreaker: resilience.NewBankCircuitBreaker(logger),
+		// We pass the raw zap logger to the external dependency.
+		circuitBreaker: resilience.NewBankCircuitBreaker(logger.WithRaw()),
 	}
 }
 
@@ -108,7 +113,8 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	defer w.sem.Release()
 
 	// 2. Create cancellable context for THIS task's lifecycle
-	taskCtx, cancel := context.WithCancel(ctx)
+	// --- WEEK 2 ADDITION: Inject Task ID for tracing ---
+	taskCtx, cancel := context.WithCancel(observability.WithTaskID(ctx, task.TaskID))
 	defer cancel()
 
 	// 3. Register for hard revocation
@@ -119,8 +125,7 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	// --- WEEK 2 ADDITION: Fencing token validation ---
 	// Placed FIRST: cheaper than a C4 network call; rejects zombie tasks immediately.
 	if err := w.epochValidator.ValidateAndUpdate(task.Epoch); err != nil {
-		w.logger.Warn("fencing: rejected stale task",
-			zap.String("task_id", task.TaskID),
+		w.logger.Warn(taskCtx, "fencing: rejected stale task",
 			zap.Error(err),
 		)
 		return nil, nil // do NOT report to C2; stale result would confuse coordinator
@@ -134,8 +139,7 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	if err := w.reservationMap.Reserve(task.IdempotencyKey); err != nil {
 		// Another goroutine in THIS binary is processing this key right now.
 		// Do not call C4 or the bank. Log and skip.
-		w.logger.Warn("reservation: concurrent duplicate suppressed locally",
-			zap.String("task_id", task.TaskID),
+		w.logger.Warn(taskCtx, "reservation: concurrent duplicate suppressed locally",
 			zap.String("idempotency_key", task.IdempotencyKey),
 		)
 		return nil, nil
@@ -167,19 +171,17 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		metrics.BankRequestDuration.Observe(float64(elapsed))
 	}()
 
-	w.logger.Info("task received", zap.String("task_id", task.TaskID))
+	w.logger.Info(taskCtx, "task received")
 
 	// ── STEP 2: Check C4 Idempotency ─────────────────────────────────────
 	exists, cachedResult, err := w.logClient.CheckIdempotency(ctx, task.IdempotencyKey)
 	if err != nil {
-		w.logger.Warn("C4 CheckIdempotency failed — will proceed to bank with caution",
-			zap.String("task_id", task.TaskID), zap.Error(err))
+		w.logger.Warn(taskCtx, "C4 CheckIdempotency failed — will proceed to bank with caution", zap.Error(err))
 	}
 
 	if exists && cachedResult != nil {
-		w.logger.Info("idempotency hit — returning cached result, skipping bank",
-			zap.String("task_id", task.TaskID))
-		metrics.TasksTotal.WithLabelValues("success").Inc()
+		w.logger.Info(taskCtx, "idempotency hit — returning cached result, skipping bank")
+		w.metrics.TasksTotal.WithLabelValues("success").Inc()
 		
 		err := w.safeReportResult(ctx, task.TaskID, cachedResult)
 		return cachedResult, err
@@ -210,13 +212,12 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	}
 
 	if err != nil {
-		w.logger.Error("bank call failed after retries",
-			zap.String("task_id", task.TaskID), zap.Error(err))
+		w.logger.Error(taskCtx, "bank call failed after retries", zap.Error(err))
 		metrics.TasksTotal.WithLabelValues("failure").Inc()
 		result.Status = domain.TaskStatusFailure
 	} else {
-		w.logger.Info("bank call succeeded", zap.String("task_id", task.TaskID), zap.String("txn_ref", txnRef))
-		metrics.TasksTotal.WithLabelValues("success").Inc()
+		w.logger.Info(taskCtx, "bank call succeeded", zap.String("txn_ref", txnRef))
+		w.metrics.TasksTotal.WithLabelValues("success").Inc()
 		result.Status = domain.TaskStatusSuccess
 		result.BankTxnRef = txnRef
 		paymentSucceeded = true // WEEK 2: mark for reservation completion
@@ -234,19 +235,15 @@ func (w *WorkerServiceImpl) safeReportResult(
 	result *domain.PaymentResult,
 ) error {
 	if _, revoked := w.revokedTasks.Load(taskID); revoked {
-		w.logger.Warn("task revoked mid-execution — discarding result",
-			zap.String("task_id", taskID))
-		metrics.TasksTotal.WithLabelValues("revoked").Inc()
+		w.logger.Warn(ctx, "task revoked mid-execution — discarding result")
+		w.metrics.TasksTotal.WithLabelValues("revoked").Inc()
 		return nil
 	}
 
 	// --- WEEK 2 ADDITION: Outbox-backed ReportResult ---
 	// Try direct delivery first; fall back to outbox on failure.
 	if err := w.reportResult(ctx, result); err != nil {
-		w.logger.Warn("direct ReportResult failed, buffering in outbox",
-			zap.String("task_id", taskID),
-			zap.Error(err),
-		)
+		w.logger.Warn(ctx, "direct ReportResult failed, buffering in outbox", zap.Error(err))
 		// Convert domain result to proto for outbox storage
 		pbResult := &pb.TaskResult{
 			TaskId:   result.TaskID,
@@ -264,15 +261,17 @@ func (w *WorkerServiceImpl) safeReportResult(
 	// --- END WEEK 2 ADDITION ---
 }
 
-// RevokeTask marks a task as revoked. Called by the gRPC RevokeTask handler.
 func (w *WorkerServiceImpl) RevokeTask(ctx context.Context, taskID string) error {
 	w.revokedTasks.Store(taskID, true)
-	metrics.RevokedTasksTotal.Inc()
-	w.logger.Warn("task marked revoked", zap.String("task_id", taskID))
+	// We use the raw metrics from internal/metrics for global counters if needed,
+	// or update NewMetrics to include it. For now, let's just use the field if it existed.
+	// Wait, RevokedTasksTotal was NOT in the NewMetrics struct. I should add it.
+	w.metrics.RecordTaskRevoked()
+	w.logger.Warn(ctx, "task marked revoked")
 
 	// --- WEEK 2 ADDITION: Hard cancellation ---
 	if w.taskRegistry.Revoke(taskID) {
-		w.logger.Info("hard revocation: cancelled active task context", zap.String("task_id", taskID))
+		w.logger.Info(ctx, "hard revocation: cancelled active task context")
 	}
 	// --- END WEEK 2 ADDITION ---
 
