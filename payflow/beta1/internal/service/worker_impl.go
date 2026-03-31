@@ -10,6 +10,7 @@ import (
 	"github.com/your-org/payflow/worker/config"
 	"github.com/your-org/payflow/worker/internal/domain"
 	"github.com/your-org/payflow/worker/internal/metrics"
+	"github.com/your-org/payflow/worker/internal/fence"
 )
 
 // WorkerServiceImpl implements the WorkerService interface.
@@ -28,6 +29,9 @@ type WorkerServiceImpl struct {
 	activeTasks   atomic.Int64
 	processed     atomic.Int64
 	totalDuration atomic.Int64 // sum of all task durations in ms
+
+	// --- WEEK 2 ADDITION: Fencing token validator ---
+	epochValidator *fence.EpochValidator
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -44,11 +48,25 @@ func NewWorkerServiceImpl(
 		reportResult: reportFn,
 		logger:       logger,
 		cfg:          cfg,
+
+		// --- WEEK 2 ADDITION: Initialize fencing validator ---
+		epochValidator: fence.NewEpochValidator(),
 	}
 }
 
 // ExecuteTask runs the exactly-once pipeline. Called once per task received from C2.
 func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) (*domain.PaymentResult, error) {
+	// --- WEEK 2 ADDITION: Fencing token validation ---
+	// Placed FIRST: cheaper than a C4 network call; rejects zombie tasks immediately.
+	if err := w.epochValidator.ValidateAndUpdate(task.Epoch); err != nil {
+		w.logger.Warn("fencing: rejected stale task",
+			zap.String("task_id", task.TaskID),
+			zap.Error(err),
+		)
+		return nil, nil // do NOT report to C2; stale result would confuse coordinator
+	}
+	// --- END WEEK 2 ADDITION ---
+
 	start := time.Now()
 	w.activeTasks.Add(1)
 	metrics.ActiveTasks.Inc()
