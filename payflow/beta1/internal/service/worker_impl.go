@@ -13,6 +13,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/fence"
 	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/outbox"
+	"github.com/your-org/payflow/worker/internal/concurrency"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
@@ -44,6 +45,13 @@ type WorkerServiceImpl struct {
 
 	// --- WEEK 2 ADDITION: Current epoch tracker ---
 	epoch int64
+
+	// --- WEEK 2 ADDITION: Concurrency control ---
+	sem          *concurrency.TaskSemaphore
+	taskRegistry *concurrency.TaskRegistry
+
+	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
+	wg *sync.WaitGroup
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -55,6 +63,9 @@ func NewWorkerServiceImpl(
 	cfg *config.Config,
 	reservationMap *reservation.Map, // WEEK 2 ADDITION
 	outbox *outbox.Outbox,         // WEEK 2 ADDITION
+	sem *concurrency.TaskSemaphore, // WEEK 2 ADDITION
+	registry *concurrency.TaskRegistry, // WEEK 2 ADDITION
+	wg *sync.WaitGroup,            // WEEK 2 ADDITION
 ) *WorkerServiceImpl {
 	return &WorkerServiceImpl{
 		bankClient:   bankClient,
@@ -66,16 +77,38 @@ func NewWorkerServiceImpl(
 		// --- WEEK 2 ADDITION: Initialize fencing validator ---
 		epochValidator: fence.NewEpochValidator(),
 
-		// --- WEEK 2 ADDITION: Wire reservation map ---
+		// --- WEEK 2 ADDITION: Wire dependencies ---
 		reservationMap: reservationMap,
-
-		// --- WEEK 2 ADDITION: Wire outbox ---
-		outbox: outbox,
+		outbox:         outbox,
+		sem:            sem,
+		taskRegistry:   registry,
+		wg:             wg,
 	}
 }
 
 // ExecuteTask runs the exactly-once pipeline. Called once per task received from C2.
 func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) (*domain.PaymentResult, error) {
+	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
+	w.wg.Add(1)
+	defer w.wg.Done()
+	// --- END WEEK 2 ADDITION ---
+
+	// --- WEEK 2 ADDITION: Concurrency & Revocation control ---
+	// 1. Acquire semaphore slot (blocks if full)
+	if err := w.sem.Acquire(ctx); err != nil {
+		return nil, err // context cancelled (likely shutdown)
+	}
+	defer w.sem.Release()
+
+	// 2. Create cancellable context for THIS task's lifecycle
+	taskCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// 3. Register for hard revocation
+	w.taskRegistry.Register(task.TaskID, cancel)
+	defer w.taskRegistry.Deregister(task.TaskID)
+	// --- END WEEK 2 ADDITION ---
+
 	// --- WEEK 2 ADDITION: Fencing token validation ---
 	// Placed FIRST: cheaper than a C4 network call; rejects zombie tasks immediately.
 	if err := w.epochValidator.ValidateAndUpdate(task.Epoch); err != nil {
@@ -85,6 +118,8 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		)
 		return nil, nil // do NOT report to C2; stale result would confuse coordinator
 	}
+	// Use the task-specific context from here on
+	ctx = taskCtx
 	w.epoch = task.Epoch // WEEK 2: track current epoch
 	// --- END WEEK 2 ADDITION ---
 
@@ -213,6 +248,13 @@ func (w *WorkerServiceImpl) RevokeTask(ctx context.Context, taskID string) error
 	w.revokedTasks.Store(taskID, true)
 	metrics.RevokedTasksTotal.Inc()
 	w.logger.Warn("task marked revoked", zap.String("task_id", taskID))
+
+	// --- WEEK 2 ADDITION: Hard cancellation ---
+	if w.taskRegistry.Revoke(taskID) {
+		w.logger.Info("hard revocation: cancelled active task context", zap.String("task_id", taskID))
+	}
+	// --- END WEEK 2 ADDITION ---
+
 	return nil
 }
 

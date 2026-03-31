@@ -18,8 +18,10 @@ import (
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/outbox"
+	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/service"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
+	"sync"
 )
 
 func main() {
@@ -100,6 +102,12 @@ func run() error {
 	outboxBuf := outbox.New(c2Client.ReportRawResult, slogLogger)
 	// --- END WEEK 2 ADDITION ---
 
+	// --- WEEK 2 ADDITION: Concurrency ---
+	sem := concurrency.NewTaskSemaphore(int64(cfg.MaxConcurrentTasks))
+	registry := concurrency.NewTaskRegistry()
+	var wg sync.WaitGroup // for task draining
+	// --- END WEEK 2 ADDITION ---
+
 	workerSvc := service.NewWorkerServiceImpl(
 		bankClient,
 		c4Client,
@@ -108,6 +116,9 @@ func run() error {
 		cfg,
 		reservationMap, // WEEK 2 ADDITION
 		outboxBuf,      // WEEK 2 ADDITION
+		sem,           // WEEK 2 ADDITION
+		registry,       // WEEK 2 ADDITION
+		&wg,            // WEEK 2 ADDITION: for graceful shutdown tracking
 	)
 
 	// Start gRPC server
@@ -154,6 +165,10 @@ func run() error {
 			}
 		}
 	}()
+	// --- END WEEK 2 ADDITION ---
+
+	// --- WEEK 2 ADDITION: Graceful Shutdown ---
+	go concurrency.GracefulShutdown(ctx, &wg, slogLogger)
 	// --- END WEEK 2 ADDITION ---
 
 	// Wait for shutdown signal
