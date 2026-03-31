@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"strconv"
@@ -47,10 +48,12 @@ type CoordinatorNode struct {
 	resetTimer    chan bool
 
 	TaskQueue chan *workerPb.TaskAssignment
+	InFlight  map[string]*workerPb.TaskAssignment
 
 	mu sync.Mutex
 
-	c4Client logPb.PaymentLogServiceClient
+	c4Client    logPb.PaymentLogServiceClient
+	peerClients map[string]coordPb.CoordinatorClusterClient // NEW: The connection pool
 }
 
 // ---------------------------------------------------------
@@ -179,44 +182,44 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 	safePayload := string(payloadBytes)
 
 	// 3. --- FORWARD TO C4 (Payment Log Service) ---
-	// CRITICAL FIX: Use persistent connection & enforce data durability
 	if c.c4Client == nil {
-		log.Printf("[LEADER %s] Cannot write to C4: Persistent client is nil", c.ID)
 		return nil, status.Errorf(codes.Internal, "internal server error: C4 client not initialized")
 	}
 
 	logRes, err := c.c4Client.AppendEntry(ctx, &logPb.LogEntry{
-		Epoch:   c.Epoch, // Assumes you changed the struct field to int64
+		Epoch:   c.Epoch,
 		TxnId:   txnID,
 		State:   "QUEUED",
 		Payload: safePayload,
 	})
 
 	if err != nil {
-		log.Printf("[LEADER %s] C4 AppendEntry failed: %v", c.ID, err)
-		// CRITICAL FIX: Abort! Do not enqueue the task if WAL write fails.
+		// It is safe to return an error here because nothing was written to the WAL.
 		return nil, status.Errorf(codes.Unavailable, "failed to persist task to WAL: %v", err)
 	}
 
 	log.Printf("[LEADER %s] Successfully wrote to C4 log! Index: %d", c.ID, logRes.LogIndex)
 
-	// 4. --- PUSH TO WORKER QUEUE ---
+	// 4. --- PUSH TO WORKER QUEUE (Decoupled) ---
 	newTask := &workerPb.TaskAssignment{
-		Epoch:          c.Epoch, // Assumes you changed the struct field to int64
+		Epoch:          c.Epoch,
 		TaskId:         txnID,
 		IdempotencyKey: req.IdempotencyKey,
 		Amount:         req.Amount,
 	}
 
-	select {
-	case c.TaskQueue <- newTask:
-		log.Printf("[LEADER %s] Task %s added to queue. Queue size: %d", c.ID, newTask.TaskId, len(c.TaskQueue))
-	case <-ctx.Done():
-		// If the request is canceled or times out before the queue frees up, fail gracefully
-		return nil, status.Errorf(codes.DeadlineExceeded, "task queue is full or request canceled")
-	}
+	// CRITICAL FIX: Launch a background goroutine to enqueue the task.
+	// This guarantees that once written to the WAL, it WILL enter the queue
+	// eventually, even if the client disconnects or the queue is temporarily full.
+	go func(task *workerPb.TaskAssignment) {
+		// We deliberately DO NOT use the client's 'ctx' here.
+		// This channel send will block safely until a worker frees up space in the queue.
+		c.TaskQueue <- task
+		log.Printf("[LEADER %s] Task %s enqueued in background. Queue size: %d", c.ID, task.TaskId, len(c.TaskQueue))
+	}(newTask)
 
-	// 5. Return success to the Gateway
+	// 5. Return success to the Gateway IMMEDIATELY.
+	// We've achieved WAL durability, so we can safely tell the client it's accepted.
 	return &paymentPb.SubmitTaskResponse{
 		TxnId: txnID,
 		Result: &paymentPb.SubmitTaskResponse_Success{
@@ -313,18 +316,21 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
 			TxnId:   req.TaskId,
 			Success: isSuccess,
-			// FIX: Uncomment this once you've added the field to worker.proto
-			// IdempotencyKey: req.GetIdempotencyKey(),
+			// IdempotencyKey: req.GetIdempotencyKey(), // FIX: Uncomment this once you've added the field to worker.proto
 		})
 
 		if err != nil {
-			log.Printf("[LEADER %s] ⚠️ C4 WriteResult failed for task %s: %v", c.ID, req.TaskId, err)
+			log.Printf("[LEADER %s] C4 WriteResult failed for task %s: %v", c.ID, req.TaskId, err)
 		} else {
 			log.Printf("[LEADER %s] Permanently recorded task %s outcome to C4.", c.ID, req.TaskId)
 		}
 	} else {
-		log.Printf("[LEADER %s] ⚠️ Skip C4 update: Persistent client is nil", c.ID)
+		log.Printf("[LEADER %s] Skip C4 update: Persistent client is nil", c.ID)
 	}
+
+	c.mu.Lock()
+	delete(c.InFlight, req.TaskId)
+	c.mu.Unlock()
 
 	// 3. Acknowledge the worker
 	return &workerPb.ResultAck{
@@ -344,29 +350,36 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 
 	log.Printf("[LEADER %s] Worker %s started polling for tasks", c.ID, req.WorkerId)
 
-	// PollTasks keeps a persistent connection open to push tasks to workers.
-	for task := range c.TaskQueue {
-		log.Printf("[LEADER %s] Dispatching task %s to worker %s", c.ID, task.TaskId, req.WorkerId)
+	// Listen for either a new task or the client disconnecting
+	for {
+		select {
+		case <-stream.Context().Done():
+			// The worker closed the connection or timed out.
+			// Exit the goroutine cleanly!
+			log.Printf("[LEADER %s] Worker %s disconnected. Closing stream.", c.ID, req.WorkerId)
+			return nil
 
-		err := stream.Send(task)
-		if err != nil {
-			log.Printf("[LEADER %s] Failed to send task %s to worker %s: %v", c.ID, task.TaskId, req.WorkerId, err)
+		case task := <-c.TaskQueue:
+			log.Printf("[LEADER %s] Dispatching task %s to worker %s", c.ID, task.TaskId, req.WorkerId)
 
-			// stream.Send() pushes the data down the open TCP connection
-			select {
-			case c.TaskQueue <- task:
-				log.Printf("[LEADER %s] Successfully re-enqueued task %s", c.ID, task.TaskId)
-			default:
-				// If the queue is totally full, we log the failure instead of deadlocking the loop
-				log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
+			err := stream.Send(task)
+			if err != nil {
+				log.Printf("[LEADER %s] Failed to send task %s to worker %s: %v", c.ID, task.TaskId, req.WorkerId, err)
+
+				// Re-enqueue the task safely
+				select {
+				case c.TaskQueue <- task:
+					log.Printf("[LEADER %s] Successfully re-enqueued task %s", c.ID, task.TaskId)
+				default:
+					log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
+				}
+				return err
 			}
-			return err
+			c.mu.Lock()
+			c.InFlight[task.TaskId] = task
+			c.mu.Unlock()
 		}
 	}
-
-	// Returning nil tells gRPC "I am done streaming, you can close the connection"
-	// Only errors are returned, returning nil means there is no error
-	return nil
 }
 
 // StartLeaderMonitor runs continuously in the background.
@@ -419,47 +432,44 @@ func (c *CoordinatorNode) triggerElection() {
 
 // broadcastElection sends an ELECTION message to all nodes with a higher ID
 func (c *CoordinatorNode) broadcastElection() {
-	higherNodes := make(map[string]string)
+	// 1. Data Race Fix: Capture the epoch safely before spawning any network calls
+	c.mu.Lock()
+	currentEpoch := c.Epoch
+	c.mu.Unlock()
 
+	higherClients := make(map[string]coordPb.CoordinatorClusterClient)
 	myNumericID := parseNodeID(c.ID)
 
-	// 1. Find nodes with a strictly higher ID string
-	for id, addr := range clusterPeers {
+	// 2. Connection Pool Fix: Filter our existing, persistent connections
+	// instead of using raw IP strings
+	for id, client := range c.peerClients {
 		peerNumericID := parseNodeID(id)
 		if peerNumericID > myNumericID {
-			higherNodes[id] = addr
+			higherClients[id] = client
 		}
 	}
 
-	// 2. Base Case: If there are no higher nodes, we win instantly!
-	if len(higherNodes) == 0 {
+	// 3. Base Case: If there are no higher nodes, we win instantly!
+	if len(higherClients) == 0 {
 		log.Printf("[Node %s] possessing highest ID, election won!", c.ID)
 		c.becomeLeader()
 		return
 	}
 
-	log.Printf("[Node %s] Broadcasting ELECTION to %d higher nodes...", c.ID, len(higherNodes))
+	log.Printf("[Node %s] Broadcasting ELECTION to %d higher nodes...", c.ID, len(higherClients))
 
-	// 3. Concurrent RPC calls using a Go channel to collect responses
-	responses := make(chan bool, len(higherNodes))
+	// 4. Concurrent RPC calls using a Go channel to collect responses
+	responses := make(chan bool, len(higherClients))
 
-	for id, addr := range higherNodes {
-		go func(peerID, peerAddr string) {
-			// 2-second timeout so a dead node doesn't freeze the election
+	for id, client := range higherClients {
+		// Pass the pre-warmed client into the goroutine!
+		go func(peerID string, cli coordPb.CoordinatorClusterClient) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
-			conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				responses <- false // Could not connect
-				return
-			}
-			defer conn.Close()
-
-			client := coordPb.NewCoordinatorClusterClient(conn)
-
-			res, err := client.Election(ctx, &coordPb.ElectionMessage{
-				Epoch:       int64(c.Epoch),
+			// No more grpc.NewClient() here! We just use the 'cli' passed in.
+			res, err := cli.Election(ctx, &coordPb.ElectionMessage{
+				Epoch:       currentEpoch, // Using the safely captured epoch
 				CandidateId: c.ID,
 			})
 
@@ -470,18 +480,18 @@ func (c *CoordinatorNode) broadcastElection() {
 			} else {
 				responses <- false
 			}
-		}(id, addr)
+		}(id, client)
 	}
 
-	// 4. Wait for all responses
+	// 5. Wait for all responses
 	gotOk := false
-	for i := 0; i < len(higherNodes); i++ {
+	for i := 0; i < len(higherClients); i++ {
 		if <-responses {
 			gotOk = true // Someone higher is alive!
 		}
 	}
 
-	// 5. Evaluate the Election Results
+	// 6. Evaluate the Election Results
 	if !gotOk {
 		log.Printf("[Node %s] No higher nodes responded OK. I am the new LEADER!", c.ID)
 		c.becomeLeader()
@@ -495,30 +505,25 @@ func (c *CoordinatorNode) broadcastElection() {
 
 // broadcastCoordinator tells all other nodes to bend the knee
 func (c *CoordinatorNode) broadcastCoordinator() {
-	for id, addr := range clusterPeers {
-		// Don't send the announcement to ourselves
-		if id == c.ID {
-			continue
-		}
+	// Safely grab the epoch to prevent data races during the broadcast
+	c.mu.Lock()
+	currentEpoch := c.Epoch
+	c.mu.Unlock()
 
+	for peerID, client := range c.peerClients {
 		// Fire off a concurrent gRPC call to each peer
-		go func(peerID, peerAddr string) {
+		go func(pID string, cli coordPb.CoordinatorClusterClient) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
-			conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			_, err := cli.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
+				Epoch:    currentEpoch,
+				LeaderId: c.ID,
+			})
 			if err != nil {
 				return // Peer is likely down, which is fine
 			}
-			defer conn.Close()
-
-			client := coordPb.NewCoordinatorClusterClient(conn)
-
-			_, err = client.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
-				Epoch:    int64(c.Epoch),
-				LeaderId: c.ID,
-			})
-		}(id, addr)
+		}(peerID, client)
 	}
 }
 
@@ -546,13 +551,88 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 
 				delete(c.Workers, workerID)
 
-				log.Printf("[LEADER %s] TODO: Reassign incomplete tasks for %s", c.ID, workerID)
+				if strandedTask, exists := c.InFlight[workerID]; exists {
+					log.Printf("[LEADER %s] Reassigning incomplete task %s from dead worker %s", c.ID, strandedTask.TaskId, workerID)
+					delete(c.InFlight, workerID)
+
+					// Push back to the queue in a goroutine to avoid blocking the monitor
+					go func(t *workerPb.TaskAssignment) {
+						c.TaskQueue <- t
+					}(strandedTask)
+				}
 			}
 		}
-		c.mu.Unlock()
-
-		time.Sleep(2 * time.Second)
 	}
+}
+
+// rebuildQueueFromC4 queries the persistent log for stranded tasks and re-enqueues them.
+func (c *CoordinatorNode) rebuildQueueFromC4() {
+	if c.c4Client == nil {
+		log.Printf("[LEADER %s] ⚠️ Cannot rebuild queue: C4 persistent client is nil", c.ID)
+		return
+	}
+
+	log.Printf("[LEADER %s] Initiating WAL recovery from C4...", c.ID)
+
+	// Give the database 10 seconds to respond with the pending records
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := c.c4Client.GetAllPending(ctx, &logPb.PendingRequest{})
+	if err != nil {
+		log.Printf("[LEADER %s] CRITICAL: Failed to fetch pending tasks from C4: %v", c.ID, err)
+		return
+	}
+
+	recoveredCount := 0
+
+	// 2. Process the stream of LogEntries one by one
+	for {
+		entry, err := stream.Recv()
+
+		if err == io.EOF {
+			// The database has finished sending all pending tasks
+			break
+		}
+		if err != nil {
+			log.Printf("[LEADER %s] ⚠️ Error reading from C4 recovery stream: %v", c.ID, err)
+			break
+		}
+
+		// 3. Unmarshal the JSON payload
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(entry.Payload), &payload); err != nil {
+			log.Printf("[LEADER %s] Failed to parse JSON payload for recovered task %s: %v", c.ID, entry.TxnId, err)
+			continue
+		}
+
+		// 4. Safely type-assert the fields extracted from the JSON map
+		amount, _ := payload["amount"].(float64)
+		// currency, _ := payload["currency"].(string)
+		// merchantID, _ := payload["merchant_id"].(string)
+		idempotencyKey, _ := payload["idempotency_key"].(string)
+
+		// 5. Reconstruct the TaskAssignment
+		recoveredTask := &workerPb.TaskAssignment{
+			Epoch:  c.Epoch, // Stamp it with the NEW leader's epoch
+			TaskId: entry.TxnId,
+			Amount: amount,
+			// Currency:       currency,
+			// MerchantId:     merchantID,
+			IdempotencyKey: idempotencyKey,
+		}
+
+		// 6. Non-blocking enqueue
+		select {
+		case c.TaskQueue <- recoveredTask:
+			recoveredCount++
+			log.Printf("[LEADER %s] Successfully re-enqueued stranded task %s", c.ID, recoveredTask.TaskId)
+		default:
+			log.Printf("[LEADER %s] ⚠️ Queue full during startup recovery! Dropped task %s", c.ID, recoveredTask.TaskId)
+		}
+	}
+
+	log.Printf("[LEADER %s] Recovery complete. Restored %d pending tasks from C4 WAL", c.ID, recoveredCount)
 }
 
 // becomeLeader locks in the victory and changes the state
@@ -565,6 +645,8 @@ func (c *CoordinatorNode) becomeLeader() {
 
 	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, c.Epoch)
 	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
+
+	c.rebuildQueueFromC4() // Recovery Function
 
 	go c.startLeaderHeartbeat()
 	go c.startWorkerMonitor()
@@ -587,6 +669,23 @@ func main() {
 		c4Client = logPb.NewPaymentLogServiceClient(c4Conn)
 	}
 
+	// Set up the persistent peer connection pool
+	peerClients := make(map[string]coordPb.CoordinatorClusterClient)
+	for id, addr := range clusterPeers {
+		if id == *idFlag {
+			continue // Don't dial ourselves
+		}
+
+		// Note: grpc.NewClient doesn't block waiting for connection by default,
+		// so it's safe to do this even if peers aren't online yet.
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Printf("Warning: Failed to setup client for peer %s: %v", id, err)
+			continue
+		}
+		peerClients[id] = coordPb.NewCoordinatorClusterClient(conn)
+	}
+
 	node := &CoordinatorNode{
 		ID:            *idFlag,
 		State:         "FOLLOWER",
@@ -595,7 +694,9 @@ func main() {
 		leaderTimeout: 5 * time.Second,
 		resetTimer:    make(chan bool, 1),
 		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
+		InFlight:      make(map[string]*workerPb.TaskAssignment),
 		c4Client:      c4Client,
+		peerClients:   peerClients,
 	}
 
 	node.StartLeaderMonitor()
