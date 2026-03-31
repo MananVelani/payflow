@@ -11,10 +11,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"log/slog"
 
 	"github.com/your-org/payflow/worker/config"
 	"github.com/your-org/payflow/worker/internal/logger"
 	"github.com/your-org/payflow/worker/internal/metrics"
+	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/service"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 )
@@ -88,12 +90,17 @@ func run() error {
 	}
 	bankClient := service.NewProductionMockBankClient(bankCfg, log)
 
+	// --- WEEK 2 ADDITION: Reservation map ---
+	reservationMap := reservation.New(5 * time.Minute)
+	// --- END WEEK 2 ADDITION ---
+
 	workerSvc := service.NewWorkerServiceImpl(
 		bankClient,
 		c4Client,
 		c2Client.ReportResult,
 		log,
 		cfg,
+		reservationMap, // WEEK 2 ADDITION
 	)
 
 	// Start gRPC server
@@ -119,6 +126,24 @@ func run() error {
 		cfg.HeartbeatInterval, workerSvc.Stats, log,
 	)
 	go heartbeat.Run(ctx)
+
+	// --- WEEK 2 ADDITION: Reservation map TTL cleanup ---
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				n := reservationMap.Cleanup()
+				if n > 0 {
+					slog.Debug("reservation: cleaned up completed entries", "count", n)
+				}
+			case <-ctx.Done(): // ctx is the worker's root context
+				return
+			}
+		}
+	}()
+	// --- END WEEK 2 ADDITION ---
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)

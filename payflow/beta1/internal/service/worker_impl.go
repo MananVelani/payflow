@@ -11,6 +11,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/domain"
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/fence"
+	"github.com/your-org/payflow/worker/internal/reservation"
 )
 
 // WorkerServiceImpl implements the WorkerService interface.
@@ -32,6 +33,9 @@ type WorkerServiceImpl struct {
 
 	// --- WEEK 2 ADDITION: Fencing token validator ---
 	epochValidator *fence.EpochValidator
+
+	// --- WEEK 2 ADDITION: Pre-flight reservation map ---
+	reservationMap *reservation.Map
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -41,6 +45,7 @@ func NewWorkerServiceImpl(
 	reportFn ReportResultFunc,
 	logger *zap.Logger,
 	cfg *config.Config,
+	reservationMap *reservation.Map, // WEEK 2 ADDITION
 ) *WorkerServiceImpl {
 	return &WorkerServiceImpl{
 		bankClient:   bankClient,
@@ -51,6 +56,9 @@ func NewWorkerServiceImpl(
 
 		// --- WEEK 2 ADDITION: Initialize fencing validator ---
 		epochValidator: fence.NewEpochValidator(),
+
+		// --- WEEK 2 ADDITION: Wire reservation map ---
+		reservationMap: reservationMap,
 	}
 }
 
@@ -65,6 +73,30 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		)
 		return nil, nil // do NOT report to C2; stale result would confuse coordinator
 	}
+	// --- END WEEK 2 ADDITION ---
+
+	// --- WEEK 2 ADDITION: Local pre-flight reservation ---
+	if err := w.reservationMap.Reserve(task.IdempotencyKey); err != nil {
+		// Another goroutine in THIS binary is processing this key right now.
+		// Do not call C4 or the bank. Log and skip.
+		w.logger.Warn("reservation: concurrent duplicate suppressed locally",
+			zap.String("task_id", task.TaskID),
+			zap.String("idempotency_key", task.IdempotencyKey),
+		)
+		return nil, nil
+	}
+
+	paymentSucceeded := false // SECTION 8: track for defer
+
+	// On any exit path (success, failure, revocation), clean up the reservation.
+	// We use a named function instead of anonymous defer to make the state explicit.
+	defer func() {
+		if paymentSucceeded {
+			w.reservationMap.Complete(task.IdempotencyKey)
+		} else {
+			w.reservationMap.Release(task.IdempotencyKey)
+		}
+	}()
 	// --- END WEEK 2 ADDITION ---
 
 	start := time.Now()
@@ -118,6 +150,7 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		metrics.TasksTotal.WithLabelValues("success").Inc()
 		result.Status = domain.TaskStatusSuccess
 		result.BankTxnRef = txnRef
+		paymentSucceeded = true // WEEK 2: mark for reservation completion
 	}
 
 	// ── STEP 4: Report Result to C2 ───────────────────────────────────────
