@@ -578,9 +578,16 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 					log.Printf("[LEADER %s] Reassigning incomplete task %s from dead worker %s", c.ID, strandedTask.TaskId, workerID)
 					delete(c.InFlight, workerID)
 
-					// Push back to the queue in a goroutine to avoid blocking the monitor
+					// Push back to the queue in a goroutine to avoid blocking the monitor.
+					// Use a non-blocking send so this goroutine cannot block indefinitely
+					// if the task queue is full.
 					go func(t *workerPb.TaskAssignment) {
-						c.TaskQueue <- t
+						select {
+						case c.TaskQueue <- t:
+							// Successfully re-enqueued stranded task.
+						default:
+							log.Printf("[LEADER %s] Failed to re-enqueue stranded task %s: task queue is full", c.ID, t.TaskId)
+						}
 					}(strandedTask)
 				}
 			}
