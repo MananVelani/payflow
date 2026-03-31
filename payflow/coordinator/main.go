@@ -166,12 +166,18 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 	log.Printf("[LEADER %s] Received task for amount: %f", c.ID, req.Amount)
 
+	if len(c.TaskQueue) >= cap(c.TaskQueue) {
+		log.Printf("[LEADER %s] TaskQueue at capacity. Rejecting request.", c.ID)
+		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, please try again")
+	}
+
 	// 2. Generate a dynamic Transaction ID (CRITICAL FIX: UUID prevents collisions)
 	txnID := "txn-" + uuid.New().String()
 
 	payloadMap := map[string]interface{}{
 		"amount":          req.Amount,
-		"merchant":        req.MerchantId,
+		"currency":        req.Currency,
+		"merchant_id":     req.MerchantId,
 		"idempotency_key": req.IdempotencyKey,
 	}
 	payloadBytes, err := json.Marshal(payloadMap) // Automatically escapes bad characters
@@ -200,23 +206,27 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 	log.Printf("[LEADER %s] Successfully wrote to C4 log! Index: %d", c.ID, logRes.LogIndex)
 
-	// 4. --- PUSH TO WORKER QUEUE (Decoupled) ---
+	// 4. --- PUSH TO WORKER QUEUE (Bounded) ---
 	newTask := &workerPb.TaskAssignment{
 		Epoch:          c.Epoch,
 		TaskId:         txnID,
 		IdempotencyKey: req.IdempotencyKey,
 		Amount:         req.Amount,
+		// Currency:       req.Currency,   // Point 6 fix
+		// MerchantId:     req.MerchantId, // Point 6 fix
 	}
 
-	// CRITICAL FIX: Launch a background goroutine to enqueue the task.
-	// This guarantees that once written to the WAL, it WILL enter the queue
-	// eventually, even if the client disconnects or the queue is temporarily full.
-	go func(task *workerPb.TaskAssignment) {
-		// We deliberately DO NOT use the client's 'ctx' here.
-		// This channel send will block safely until a worker frees up space in the queue.
-		c.TaskQueue <- task
-		log.Printf("[LEADER %s] Task %s enqueued in background. Queue size: %d", c.ID, task.TaskId, len(c.TaskQueue))
-	}(newTask)
+	// POINT 3 FIX: Use a select statement with a strict timeout instead of an unbounded goroutine.
+	select {
+	case c.TaskQueue <- newTask:
+		// Success! The queue had space.
+		log.Printf("[LEADER %s] Task %s enqueued. Queue size: %d", c.ID, txnID, len(c.TaskQueue))
+	case <-time.After(1 * time.Second):
+		// The queue filled up during the split-second we were writing to the database.
+		// We drop the memory operation to prevent a goroutine leak. 
+		// The task is safe in the C4 WAL and will be recovered on the next leader election.
+		log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
+	}
 
 	// 5. Return success to the Gateway IMMEDIATELY.
 	// We've achieved WAL durability, so we can safely tell the client it's accepted.
@@ -269,24 +279,38 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 
 // startLeaderHeartbeat continuously suppresses follower elections
 func (c *CoordinatorNode) startLeaderHeartbeat() {
-	log.Printf("[LEADER %s] Starting heartbeat broadcaster...", c.ID)
+	log.Printf("[LEADER %s] Starting dedicated per-peer heartbeat tickers...", c.ID)
 
-	for {
-		c.mu.Lock()
-		state := c.State
-		c.mu.Unlock()
+	for peerID, client := range c.peerClients {
+		// Spawn exactly ONE long-lived goroutine per peer
+		go func(pID string, cli coordPb.CoordinatorClusterClient) {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
 
-		// If we ever step down (e.g., a bigger node joins), kill this loop!
-		if state != "LEADER" {
-			log.Printf("[Node %s] No longer leader. Stopping heartbeats.", c.ID)
-			return
-		}
+			for range ticker.C {
+				c.mu.Lock()
+				state := c.State
+				epoch := c.Epoch
+				c.mu.Unlock()
 
-		// Broadcast our leadership to reset all follower timers
-		c.broadcastCoordinator()
+				// If we step down, this specific peer's goroutine quietly exits
+				if state != "LEADER" {
+					return 
+				}
 
-		// Sleep for 2 seconds (must be strictly less than the 5-second follower timeout!)
-		time.Sleep(2 * time.Second)
+				// Strict 1-second timeout prevents overlapping network hangs
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				_, err := cli.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
+					Epoch:    epoch,
+					LeaderId: c.ID,
+				})
+				cancel() // Always cancel context after the call
+				
+				if err != nil {
+					// Peer is down, but we don't leak goroutines waiting for them
+				}
+			}
+		}(peerID, client)
 	}
 }
 
@@ -329,7 +353,7 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	}
 
 	c.mu.Lock()
-	delete(c.InFlight, req.TaskId)
+	delete(c.InFlight, req.WorkerId)
 	c.mu.Unlock()
 
 	// 3. Acknowledge the worker
@@ -376,7 +400,7 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 				return err
 			}
 			c.mu.Lock()
-			c.InFlight[task.TaskId] = task
+			c.InFlight[req.WorkerId] = task
 			c.mu.Unlock()
 		}
 	}
@@ -531,19 +555,18 @@ func (c *CoordinatorNode) broadcastCoordinator() {
 func (c *CoordinatorNode) startWorkerMonitor() {
 	log.Printf("[LEADER %s] Starting worker heartbeat monitor...", c.ID)
 
-	for {
-		c.mu.Lock()
-		state := c.State
-		c.mu.Unlock()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
-		if state != "LEADER" {
+	for range ticker.C {
+		c.mu.Lock()
+
+		if c.State != "LEADER" {
 			log.Printf("[Node %s] Stepped down. Stopping worker monitor.", c.ID)
 			return
 		}
 
-		c.mu.Lock()
 		now := time.Now()
-
 		for workerID, lastSeen := range c.Workers {
 			// If it has been more than 6 seconds since their last ping...
 			if now.Sub(lastSeen) > 6*time.Second {
@@ -562,6 +585,7 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 				}
 			}
 		}
+		c.mu.Unlock()
 	}
 }
 
@@ -578,7 +602,9 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stream, err := c.c4Client.GetAllPending(ctx, &logPb.PendingRequest{})
+	stream, err := c.c4Client.GetAllPending(ctx, &logPb.PendingRequest{
+		Epoch: c.Epoch,
+	})
 	if err != nil {
 		log.Printf("[LEADER %s] CRITICAL: Failed to fetch pending tasks from C4: %v", c.ID, err)
 		return
@@ -661,12 +687,10 @@ func main() {
 	var c4Client logPb.PaymentLogServiceClient // Declare variable
 	c4Conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
 
-	if err != nil {
-		log.Printf("Warning: Could not connect to C4 at startup: %v", err)
-		c4Client = nil // Will check for nil before every C4 operation
-	} else {
-		log.Printf("Established persistent connection to C4")
+	if err == nil {
+		defer c4Conn.Close()
 		c4Client = logPb.NewPaymentLogServiceClient(c4Conn)
+		log.Printf("Successfully connected to C4 Database!")
 	}
 
 	// Set up the persistent peer connection pool
@@ -679,11 +703,10 @@ func main() {
 		// Note: grpc.NewClient doesn't block waiting for connection by default,
 		// so it's safe to do this even if peers aren't online yet.
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Warning: Failed to setup client for peer %s: %v", id, err)
-			continue
+		if err == nil {
+			defer conn.Close() // Ensure connections are cleaned up on shutdown
+			peerClients[id] = coordPb.NewCoordinatorClusterClient(conn)
 		}
-		peerClients[id] = coordPb.NewCoordinatorClusterClient(conn)
 	}
 
 	node := &CoordinatorNode{
