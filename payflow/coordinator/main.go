@@ -221,23 +221,20 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 	case c.TaskQueue <- newTask:
 		// Success! The queue had space.
 		log.Printf("[LEADER %s] Task %s enqueued. Queue size: %d", c.ID, txnID, len(c.TaskQueue))
+		return &paymentPb.SubmitTaskResponse{
+			TxnId: txnID,
+			Result: &paymentPb.SubmitTaskResponse_Success{
+				Success: true,
+			},
+		}, nil
 	case <-time.After(1 * time.Second):
 		// The queue filled up during the split-second we were writing to the database.
 		// We drop the memory operation to prevent a goroutine leak. 
 		// The task is safe in the C4 WAL and will be recovered on the next leader election.
 		log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
+		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, task %s recorded but delayed", txnID)
 	}
-
-	// 5. Return success to the Gateway IMMEDIATELY.
-	// We've achieved WAL durability, so we can safely tell the client it's accepted.
-	return &paymentPb.SubmitTaskResponse{
-		TxnId: txnID,
-		Result: &paymentPb.SubmitTaskResponse_Success{
-			Success: true,
-		},
-	}, nil
 }
-
 // ---------------------------------------------------------
 // 3. WORKER MANAGEMENT SERVICE (From C3 Workers)
 // ---------------------------------------------------------
