@@ -12,6 +12,8 @@ import (
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/fence"
 	"github.com/your-org/payflow/worker/internal/reservation"
+	"github.com/your-org/payflow/worker/internal/outbox"
+	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
 // WorkerServiceImpl implements the WorkerService interface.
@@ -36,6 +38,12 @@ type WorkerServiceImpl struct {
 
 	// --- WEEK 2 ADDITION: Pre-flight reservation map ---
 	reservationMap *reservation.Map
+
+	// --- WEEK 2 ADDITION: In-memory outbox ---
+	outbox *outbox.Outbox
+
+	// --- WEEK 2 ADDITION: Current epoch tracker ---
+	epoch int64
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -46,6 +54,7 @@ func NewWorkerServiceImpl(
 	logger *zap.Logger,
 	cfg *config.Config,
 	reservationMap *reservation.Map, // WEEK 2 ADDITION
+	outbox *outbox.Outbox,         // WEEK 2 ADDITION
 ) *WorkerServiceImpl {
 	return &WorkerServiceImpl{
 		bankClient:   bankClient,
@@ -59,6 +68,9 @@ func NewWorkerServiceImpl(
 
 		// --- WEEK 2 ADDITION: Wire reservation map ---
 		reservationMap: reservationMap,
+
+		// --- WEEK 2 ADDITION: Wire outbox ---
+		outbox: outbox,
 	}
 }
 
@@ -73,6 +85,7 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		)
 		return nil, nil // do NOT report to C2; stale result would confuse coordinator
 	}
+	w.epoch = task.Epoch // WEEK 2: track current epoch
 	// --- END WEEK 2 ADDITION ---
 
 	// --- WEEK 2 ADDITION: Local pre-flight reservation ---
@@ -170,7 +183,29 @@ func (w *WorkerServiceImpl) safeReportResult(
 		metrics.TasksTotal.WithLabelValues("revoked").Inc()
 		return nil
 	}
-	return w.reportResult(ctx, result)
+
+	// --- WEEK 2 ADDITION: Outbox-backed ReportResult ---
+	// Try direct delivery first; fall back to outbox on failure.
+	if err := w.reportResult(ctx, result); err != nil {
+		w.logger.Warn("direct ReportResult failed, buffering in outbox",
+			zap.String("task_id", taskID),
+			zap.Error(err),
+		)
+		// Convert domain result to proto for outbox storage
+		pbResult := &pb.TaskResult{
+			TaskId:   result.TaskID,
+			WorkerId: result.WorkerID,
+			Epoch:    w.epoch,
+		}
+		if result.Status == domain.TaskStatusSuccess {
+			pbResult.Status = &pb.TaskResult_Success{Success: true}
+		} else {
+			pbResult.Status = &pb.TaskResult_ErrorMessage{ErrorMessage: "payment failed"}
+		}
+		w.outbox.Enqueue(pbResult) // background goroutine will retry
+	}
+	return nil
+	// --- END WEEK 2 ADDITION ---
 }
 
 // RevokeTask marks a task as revoked. Called by the gRPC RevokeTask handler.

@@ -39,8 +39,7 @@ func (c *C2Client) ReportResult(ctx context.Context, result *domain.PaymentResul
 	req := &pb.TaskResult{
 		TaskId:   result.TaskID,
 		WorkerId: result.WorkerID,
-		// Epoch is filled from result or config if needed, but TaskResult has it.
-		// For now, we'll assume the worker's current epoch or the one from the task.
+		// Epoch is filled by the service layer now
 	}
 
 	if result.Status == domain.TaskStatusSuccess {
@@ -49,16 +48,18 @@ func (c *C2Client) ReportResult(ctx context.Context, result *domain.PaymentResul
 		req.Status = &pb.TaskResult_ErrorMessage{ErrorMessage: "payment failed"}
 	}
 
-	_, err := c.client.ReportResult(ctx, req)
-	if err != nil {
-		c.logger.Error("ReportResult to C2 failed", zap.Error(err))
-		return err
-	}
+	_, err := c.ReportRawResult(ctx, req)
+	return err
+}
 
-	c.logger.Info("ReportResult sent to C2",
-		zap.String("task_id", result.TaskID),
-		zap.String("status", string(result.Status)))
-	return nil
+// ReportRawResult sends a pre-built proto result to C2. Used by the outbox relay.
+func (c *C2Client) ReportRawResult(ctx context.Context, req *pb.TaskResult) (*pb.ResultAck, error) {
+	resp, err := c.client.ReportResult(ctx, req)
+	if err != nil {
+		c.logger.Error("ReportRawResult to C2 failed", zap.Error(err))
+		return nil, err
+	}
+	return resp, nil
 }
 
 // Close releases the gRPC connection.

@@ -17,6 +17,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/logger"
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/reservation"
+	"github.com/your-org/payflow/worker/internal/outbox"
 	"github.com/your-org/payflow/worker/internal/service"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 )
@@ -92,6 +93,11 @@ func run() error {
 
 	// --- WEEK 2 ADDITION: Reservation map ---
 	reservationMap := reservation.New(5 * time.Minute)
+ 
+	// --- WEEK 2 ADDITION: In-memory outbox ---
+	// Wrap slog for the outbox (Section 7: will be upgraded to observability.Logger in CP-6)
+	slogLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	outboxBuf := outbox.New(c2Client.ReportRawResult, slogLogger)
 	// --- END WEEK 2 ADDITION ---
 
 	workerSvc := service.NewWorkerServiceImpl(
@@ -101,6 +107,7 @@ func run() error {
 		log,
 		cfg,
 		reservationMap, // WEEK 2 ADDITION
+		outboxBuf,      // WEEK 2 ADDITION
 	)
 
 	// Start gRPC server
@@ -126,6 +133,10 @@ func run() error {
 		cfg.HeartbeatInterval, workerSvc.Stats, log,
 	)
 	go heartbeat.Run(ctx)
+
+	// --- WEEK 2 ADDITION: Outbox relay ---
+	outboxBuf.Start(ctx)
+	// --- END WEEK 2 ADDITION ---
 
 	// --- WEEK 2 ADDITION: Reservation map TTL cleanup ---
 	go func() {
