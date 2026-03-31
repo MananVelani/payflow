@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package payflow.coordinator.v1;
+option go_package = "payflow/proto/coordinator";
+
+service CoordinatorCluster {
+    // Bully election messages 
+    rpc Election(ElectionMessage) returns (ElectionResponse);
+    rpc AnnounceCoordinator(CoordinatorMessage) returns (AckResponse);
+}
+
+message ElectionMessage {
+    // Any node receiving a lower-epoch message ignores it [cite: 96, 174]
+    int64 epoch = 1; 
+    string candidate_id = 2;
+}
+
+message ElectionResponse {
+    int64 epoch = 1;
+    // The OK response in the Bully Algorithm 
+    bool ok = 2; 
+}
+
+message CoordinatorMessage {
+    int64 epoch = 1;
+    // The COORDINATOR announcement 
+    string leader_id = 2; 
+}
+
+message AckResponse {
+    bool acknowledged = 1;
+}
