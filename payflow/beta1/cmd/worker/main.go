@@ -21,6 +21,7 @@ import (
 	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/observability"
 	"github.com/your-org/payflow/worker/internal/service"
+	"github.com/your-org/payflow/worker/internal/stream"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 	"sync"
 )
@@ -66,12 +67,17 @@ func run() error {
 		}
 	}()
 
-	// WEEK 2: Real Dependency Injection
-	c2Client, err := grpctransport.NewC2Client(cfg.CoordinatorAddr, log)
+	// --- CP-7: Connect with Retry + Keepalive ──────────────────
+	// We establish a long-lived, keepalive-enabled connection that automatically
+	// handles reconnects behind the scenes for the C2 clients.
+	rootCtx := context.Background() // base context for long-lived streams
+	conn, err := stream.ConnectWithRetry(rootCtx, cfg.CoordinatorAddr, log)
 	if err != nil {
-		return fmt.Errorf("failed to init C2 client: %w", err)
+		return fmt.Errorf("coordinator connection failed: %w", err)
 	}
-	defer c2Client.Close()
+	defer conn.Close()
+
+	c2Client := grpctransport.NewC2Client(conn, log)
 
 	c4Client, err := service.NewLogClientImpl(cfg.LogServiceAddr)
 	if err != nil {
@@ -140,15 +146,22 @@ func run() error {
 	grpcErrCh := make(chan error, 1)
 	go func() { grpcErrCh <- grpcServer.Serve() }()
 
-	// Start heartbeat loop
+	// ── CP-7: Heartbeat with Keepalive ───────────────────────
+	// Root context for long-lived components
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	heartbeat := grpctransport.NewHeartbeatClient(
-		cfg.CoordinatorAddr, workerID, assignedPort, cfg.MaxConcurrentTasks,
+		workerID, assignedPort, cfg.MaxConcurrentTasks,
 		cfg.HeartbeatInterval, workerSvc.Stats, log,
 	)
-	go heartbeat.Run(ctx)
+	
+	registerFn := func(sCtx context.Context) error {
+		return heartbeat.RunSession(sCtx, conn)
+	}
+	
+	// Run the heartbeat loop with infinite retry
+	go stream.RegisterWithRetry(ctx, "heartbeat", registerFn, log)
 
 	// --- WEEK 2 ADDITION: Outbox relay ---
 	outboxBuf.Start(ctx)

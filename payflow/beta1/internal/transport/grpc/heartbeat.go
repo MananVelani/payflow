@@ -7,7 +7,6 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/your-org/payflow/worker/internal/domain"
 	"github.com/your-org/payflow/worker/internal/metrics"
@@ -26,54 +25,25 @@ type HeartbeatClient struct {
 }
 
 func NewHeartbeatClient(
-	coordinatorAddr, workerID string,
+	workerID string,
 	grpcPort, maxCapacity int,
 	interval time.Duration,
 	statsProvider func() domain.WorkerStats,
 	logger *zap.Logger,
 ) *HeartbeatClient {
 	return &HeartbeatClient{
-		coordinatorAddr: coordinatorAddr,
-		workerID:        workerID,
-		grpcPort:        grpcPort,
-		maxCapacity:     maxCapacity,
-		interval:        interval,
-		statsProvider:   statsProvider,
-		logger:          logger,
+		workerID:      workerID,
+		grpcPort:      grpcPort,
+		maxCapacity:   maxCapacity,
+		interval:      interval,
+		statsProvider: statsProvider,
+		logger:        logger,
 	}
 }
 
-// Run loops forever until ctx is cancelled.
-// On coordinator disconnect (e.g. leader election), it reconnects automatically.
-func (h *HeartbeatClient) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			h.logger.Info("heartbeat loop stopping")
-			return
-		default:
-		}
-		h.logger.Info("connecting to coordinator", zap.String("addr", h.coordinatorAddr), zap.String("worker_id", h.workerID))
-		if err := h.runSession(ctx); err != nil {
-			h.logger.Warn("coordinator session ended — reconnecting in 2s", zap.Error(err))
-			select {
-			case <-time.After(2 * time.Second):
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-func (h *HeartbeatClient) runSession(ctx context.Context) error {
-	conn, err := grpc.DialContext(ctx, h.coordinatorAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
+// RunSession keeps the heartbeat alive for a given connection.
+// It returns an error if the connection or stream fails.
+func (h *HeartbeatClient) RunSession(ctx context.Context, conn *grpc.ClientConn) error {
 	client := pb.NewWorkerManagementClient(conn)
 
 	// ── STEP 1: Registration ─────────────────────────────────────────────

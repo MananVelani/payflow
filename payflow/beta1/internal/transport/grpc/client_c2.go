@@ -2,11 +2,9 @@ package grpctransport
 
 import (
 	"context"
-	"fmt"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/your-org/payflow/worker/internal/domain"
 	pb "github.com/your-org/payflow/worker/proto/worker"
@@ -19,18 +17,13 @@ type C2Client struct {
 	logger *zap.Logger
 }
 
-// NewC2Client dials the coordinator and returns a ready C2Client.
-// addr is from config: COORDINATOR_ADDR
-func NewC2Client(addr string, logger *zap.Logger) (*C2Client, error) {
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial coordinator %s: %w", addr, err)
-	}
+// NewC2Client returns a ready C2Client for an existing connection.
+func NewC2Client(conn *grpc.ClientConn, logger *zap.Logger) *C2Client {
 	return &C2Client{
 		conn:   conn,
 		client: pb.NewWorkerManagementClient(conn),
 		logger: logger,
-	}, nil
+	}
 }
 
 // ReportResult sends the payment outcome to C2.
