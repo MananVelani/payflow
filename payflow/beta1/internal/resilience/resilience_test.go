@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	apperrors "github.com/your-org/payflow/worker/internal/errors"
 	"github.com/your-org/payflow/worker/internal/resilience"
 	"go.uber.org/zap"
 )
@@ -23,7 +24,7 @@ func TestFullJitterDistribution(t *testing.T) {
 				return errors.New("fail once")
 			}
 			return nil
-		}, 3, baseDelay)
+		}, 3, baseDelay, 1*time.Second)
 
 		elapsed := time.Since(start)
 		// Delay should be rand(0, baseDelay*1) = rand(0, 100ms)
@@ -43,7 +44,7 @@ func TestJitterNeverExceedsMaxDelay(t *testing.T) {
 	_ = resilience.ExecuteWithRetry(ctx, func() error {
 		count++
 		return errors.New("always fail")
-	}, maxAttempts, baseDelay)
+	}, maxAttempts, baseDelay, 30*time.Second)
 
 	elapsed := time.Since(start)
 	
@@ -61,7 +62,7 @@ func TestRetryRespectsContextCancel(t *testing.T) {
 	
 	err := resilience.ExecuteWithRetry(ctx, func() error {
 		return nil
-	}, 3, 100*time.Millisecond)
+	}, 3, 100*time.Millisecond, 1*time.Second)
 	
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
@@ -77,7 +78,7 @@ func TestRetrySucceedsOnSecondAttempt(t *testing.T) {
 			return errors.New("first fail")
 		}
 		return nil
-	}, 3, 10*time.Millisecond)
+	}, 3, 10*time.Millisecond, 1*time.Second)
 	
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
@@ -89,7 +90,7 @@ func TestRetrySucceedsOnSecondAttempt(t *testing.T) {
 
 func TestCircuitBreakerStaysClosedAt10Percent(t *testing.T) {
 	logger := zap.NewNop()
-	cb := resilience.NewBankCircuitBreaker(logger)
+	cb := resilience.NewBankCircuitBreaker(5, 30*time.Second, 0.5, logger)
 	
 	// 10 requests, 1 failure (10%)
 	for i := 0; i < 10; i++ {
@@ -112,7 +113,7 @@ func TestCircuitBreakerStaysClosedAt10Percent(t *testing.T) {
 
 func TestCircuitBreakerOpensAbove50Percent(t *testing.T) {
 	logger := zap.NewNop()
-	cb := resilience.NewBankCircuitBreaker(logger)
+	cb := resilience.NewBankCircuitBreaker(5, 30*time.Second, 0.5, logger)
 	
 	// 4 requests, 3 failures (75% > 50%)
 	for i := 0; i < 4; i++ {
@@ -128,7 +129,7 @@ func TestCircuitBreakerOpensAbove50Percent(t *testing.T) {
 	_, err := cb.Execute(func() (interface{}, error) {
 		return "ok", nil
 	})
-	if err == nil || err.Error() != "circuit breaker is open" {
-		t.Fatalf("expected circuit breaker is open, got %v", err)
+	if err == nil || !errors.Is(err, apperrors.ErrCircuitOpen) {
+		t.Fatalf("expected ErrCircuitOpen, got %v", err)
 	}
 }

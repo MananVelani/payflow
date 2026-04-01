@@ -2,6 +2,8 @@ package concurrency_test
 
 import (
 	"context"
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -9,8 +11,10 @@ import (
 )
 
 func TestSemaphore_AcquireRelease(t *testing.T) {
-	sem := concurrency.NewTaskSemaphore(2)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	sem := concurrency.NewTaskSemaphore(2, nil, 60*time.Second, nil, nil, logger)
 	ctx := context.Background()
+
 
 	_ = sem.Acquire(ctx)
 	_ = sem.Acquire(ctx)

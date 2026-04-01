@@ -3,6 +3,8 @@ package fence
 import (
 	"fmt"
 	"sync/atomic"
+
+	apperrors "github.com/your-org/payflow/worker/internal/errors"
 )
 
 // EpochValidator enforces monotonically increasing epoch validation.
@@ -19,7 +21,8 @@ func NewEpochValidator() *EpochValidator {
 }
 
 // ValidationError is a typed error so callers can distinguish fence failures
-// from other errors with errors.As().
+// from other errors with errors.As(). It wraps ErrEpochStale so that
+// errors.Is(err, apperrors.ErrEpochStale) returns true through any wrap depth.
 type ValidationError struct {
 	IncomingEpoch int64
 	LastSeen      int64
@@ -31,6 +34,9 @@ func (e *ValidationError) Error() string {
 		e.IncomingEpoch, e.LastSeen,
 	)
 }
+
+// Unwrap links ValidationError to the sentinel so errors.Is propagates.
+func (e *ValidationError) Unwrap() error { return apperrors.ErrEpochStale }
 
 // ValidateAndUpdate checks that incomingEpoch >= lastSeenEpoch and atomically
 // updates lastSeenEpoch if valid. Returns *ValidationError on failure so callers

@@ -2,20 +2,23 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
-	"github.com/your-org/payflow/worker/config"
-	"github.com/your-org/payflow/worker/internal/domain"
-	"github.com/your-org/payflow/worker/internal/metrics"
-	"github.com/your-org/payflow/worker/internal/fence"
-	"github.com/your-org/payflow/worker/internal/reservation"
-	"github.com/your-org/payflow/worker/internal/outbox"
+
+	"github.com/your-org/payflow/worker/internal/config"
 	"github.com/your-org/payflow/worker/internal/concurrency"
-	"github.com/your-org/payflow/worker/internal/resilience"
+	"github.com/your-org/payflow/worker/internal/domain"
+	apperrors "github.com/your-org/payflow/worker/internal/errors"
+	"github.com/your-org/payflow/worker/internal/fence"
 	"github.com/your-org/payflow/worker/internal/observability"
+	"github.com/your-org/payflow/worker/internal/outbox"
+	"github.com/your-org/payflow/worker/internal/resilience"
+	"github.com/your-org/payflow/worker/internal/reservation"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
@@ -41,8 +44,9 @@ type WorkerServiceImpl struct {
 	// --- WEEK 2 ADDITION: Fencing token validator ---
 	epochValidator *fence.EpochValidator
 
-	// --- WEEK 2 ADDITION: Pre-flight reservation map ---
-	reservationMap *reservation.Map
+	// --- WEEK 2 ADDITION: Pre-flight reservation store ---
+	reservationStore reservation.Store
+
 
 	// --- WEEK 2 ADDITION: In-memory outbox ---
 	outbox *outbox.Outbox
@@ -68,25 +72,29 @@ func NewWorkerServiceImpl(
 	reportFn ReportResultFunc,
 	logger *observability.Logger, // WEEK 2: upgraded
 	cfg *config.Config,
-	reservationMap *reservation.Map, // WEEK 2 ADDITION
-	outbox *outbox.Outbox,         // WEEK 2 ADDITION
-	sem *concurrency.TaskSemaphore, // WEEK 2 ADDITION
+	reservationStore reservation.Store, // WEEK 2 ADDITION
+	outbox *outbox.Outbox,              // WEEK 2 ADDITION
+	sem *concurrency.TaskSemaphore,    // WEEK 2 ADDITION
 	registry *concurrency.TaskRegistry, // WEEK 2 ADDITION
-	wg *sync.WaitGroup,            // WEEK 2 ADDITION
+	wg *sync.WaitGroup,                 // WEEK 2 ADDITION
+	metrics *observability.Metrics,      // WEEK 2 ADDITION
+
 ) *WorkerServiceImpl {
+
 	return &WorkerServiceImpl{
 		bankClient:   bankClient,
 		logClient:    logClient,
 		reportResult: reportFn,
 		logger:       logger,
 		cfg:          cfg,
-		metrics:      observability.NewMetrics(), // WEEK 2 ADDITION
+		metrics:      metrics, // WEEK 2 ADDITION
+
 
 		// --- WEEK 2 ADDITION: Initialize fencing validator ---
 		epochValidator: fence.NewEpochValidator(),
 
 		// --- WEEK 2 ADDITION: Initialize dependencies ---
-		reservationMap: reservationMap,
+		reservationStore: reservationStore,
 		outbox:         outbox,
 		sem:            sem,
 		taskRegistry:   registry,
@@ -94,7 +102,12 @@ func NewWorkerServiceImpl(
 
 		// --- WEEK 2 ADDITION: Initialize circuit breaker ---
 		// We pass the raw zap logger to the external dependency.
-		circuitBreaker: resilience.NewBankCircuitBreaker(logger.WithRaw()),
+		circuitBreaker: resilience.NewBankCircuitBreaker(
+			cfg.CBMaxRequests,
+			cfg.CBTimeout,
+			cfg.CBFailureThreshold,
+			logger.WithRaw(),
+		),
 	}
 }
 
@@ -108,7 +121,12 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	// --- WEEK 2 ADDITION: Concurrency & Revocation control ---
 	// 1. Acquire semaphore slot (blocks if full)
 	if err := w.sem.Acquire(ctx); err != nil {
-		return nil, err // context cancelled (likely shutdown)
+		if errors.Is(err, apperrors.ErrSemaphoreFull) {
+			w.logger.Warn(ctx, "semaphore at capacity", zap.Error(err))
+			return nil, fmt.Errorf("execute task %s: %w", task.TaskID, err)
+		}
+		// context cancelled — likely graceful shutdown
+		return nil, err
 	}
 	defer w.sem.Release()
 
@@ -125,67 +143,86 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	// --- WEEK 2 ADDITION: Fencing token validation ---
 	// Placed FIRST: cheaper than a C4 network call; rejects zombie tasks immediately.
 	if err := w.epochValidator.ValidateAndUpdate(task.Epoch); err != nil {
-		w.logger.Warn(taskCtx, "fencing: rejected stale task",
-			zap.Error(err),
-		)
-		return nil, nil // do NOT report to C2; stale result would confuse coordinator
+		var ve *fence.ValidationError
+		if errors.As(err, &ve) {
+			w.logger.Warn(taskCtx, "fencing: rejected stale task",
+				zap.Int64("incoming_epoch", ve.IncomingEpoch),
+				zap.Int64("last_seen", ve.LastSeen),
+			)
+		} else {
+			w.logger.Warn(taskCtx, "fencing: rejected stale task", zap.Error(err))
+		}
+		return nil, &apperrors.TaskError{TaskID: task.TaskID, Stage: "epoch_check", Err: err}
 	}
 	// Use the task-specific context from here on
 	ctx = taskCtx
 	w.epoch = task.Epoch // WEEK 2: track current epoch
 	// --- END WEEK 2 ADDITION ---
 
-	// --- WEEK 2 ADDITION: Local pre-flight reservation ---
-	if err := w.reservationMap.Reserve(task.IdempotencyKey); err != nil {
-		// Another goroutine in THIS binary is processing this key right now.
-		// Do not call C4 or the bank. Log and skip.
-		w.logger.Warn(taskCtx, "reservation: concurrent duplicate suppressed locally",
+	// --- WEEK 2 ADDITION: Distributed pre-flight reservation ---
+	// Default TTL: 5 minutes
+	ok, err := w.reservationStore.Reserve(ctx, task.IdempotencyKey, 5*time.Minute)
+	if err != nil {
+		w.logger.Error(ctx, "reservation: failure in store",
+			zap.Error(fmt.Errorf("%w", &apperrors.TaskError{TaskID: task.TaskID, Stage: "reservation", Err: err})),
+		)
+		return nil, &apperrors.TaskError{TaskID: task.TaskID, Stage: "reservation", Err: err}
+	}
+	if !ok {
+		w.logger.Warn(ctx, "reservation: concurrent duplicate suppressed",
 			zap.String("idempotency_key", task.IdempotencyKey),
 		)
-		return nil, nil
+		return nil, &apperrors.TaskError{
+			TaskID: task.TaskID,
+			Stage:  "reservation",
+			Err:    fmt.Errorf("key %s: %w", task.IdempotencyKey, apperrors.ErrIdempotentKey),
+		}
 	}
+
+	// ── Deadline: wire task deadline into context ──────────────────────────
+	// Done AFTER reservation so the idempotency key is already held before
+	// we spend any of the task's time budget on actual work.
+	if task.DeadlineUnixMs > 0 {
+		deadline := time.UnixMilli(task.DeadlineUnixMs)
+		var deadlineCancel context.CancelFunc
+		ctx, deadlineCancel = context.WithDeadline(ctx, deadline)
+		defer deadlineCancel()
+	}
+
+
 
 	paymentSucceeded := false // SECTION 8: track for defer
 
 	// On any exit path (success, failure, revocation), clean up the reservation.
-	// We use a named function instead of anonymous defer to make the state explicit.
 	defer func() {
-		if paymentSucceeded {
-			w.reservationMap.Complete(task.IdempotencyKey)
-		} else {
-			w.reservationMap.Release(task.IdempotencyKey)
+		if !paymentSucceeded {
+			_ = w.reservationStore.Release(context.Background(), task.IdempotencyKey)
 		}
+		// On success, we let it expire naturally or be cleaned up or persisted in C4.
+		// In SET-NX pattern, releasing on success is optional but helps with quick retries if C4 failed.
+		// However, the requested implementation of Release is DEL.
 	}()
+
 	// --- END WEEK 2 ADDITION ---
-
-	start := time.Now()
-	w.activeTasks.Add(1)
-	metrics.ActiveTasks.Inc()
-	
-	defer func() {
-		w.activeTasks.Add(-1)
-		metrics.ActiveTasks.Dec()
-		elapsed := time.Since(start).Milliseconds()
-		w.totalDuration.Add(elapsed)
-		w.processed.Add(1)
-		metrics.BankRequestDuration.Observe(float64(elapsed))
-	}()
-
-	w.logger.Info(taskCtx, "task received")
 
 	// ── STEP 2: Check C4 Idempotency ─────────────────────────────────────
 	exists, cachedResult, err := w.logClient.CheckIdempotency(ctx, task.IdempotencyKey)
 	if err != nil {
+		if isDeadlineExceeded(err) {
+			w.metrics.RecordDeadlineExceeded("c4_log")
+			w.logger.Error(ctx, "C4 CheckIdempotency deadline exceeded", zap.Error(err))
+			return nil, err
+		}
 		w.logger.Warn(taskCtx, "C4 CheckIdempotency failed — will proceed to bank with caution", zap.Error(err))
 	}
 
 	if exists && cachedResult != nil {
 		w.logger.Info(taskCtx, "idempotency hit — returning cached result, skipping bank")
-		w.metrics.TasksTotal.WithLabelValues("success").Inc()
 		
 		err := w.safeReportResult(ctx, task.TaskID, cachedResult)
 		return cachedResult, err
 	}
+
 
 	// ── STEP 3: Call Mock Bank (Resilient Path) ───────────────────────────
 	// --- WEEK 2 ADDITION: Resilience (Retry + Circuit Breaker) ---
@@ -199,10 +236,20 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	// 1. Wrap in circuit breaker
 	_, err = w.circuitBreaker.Execute(func() (interface{}, error) {
 		// 2. Wrap in custom full-jitter retry engine
-		// Max 3 attempts, 100ms base delay
-		return nil, resilience.ExecuteWithRetry(ctx, bankOp, 3, 100*time.Millisecond)
+		return nil, resilience.ExecuteWithRetry(
+			ctx,
+			bankOp,
+			w.cfg.RetryMaxAttempts,
+			w.cfg.RetryBaseDelay,
+			w.cfg.RetryMaxDelay,
+		)
 	})
+	if err != nil && isDeadlineExceeded(err) {
+		w.metrics.RecordDeadlineExceeded("bank")
+		w.logger.Error(ctx, "bank call deadline exceeded", zap.Error(err))
+	}
 	// --- END WEEK 2 ADDITION ---
+
 	
 	result := &domain.PaymentResult{
 		TaskID:         task.TaskID,
@@ -212,16 +259,27 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	}
 
 	if err != nil {
-		w.logger.Error(taskCtx, "bank call failed after retries", zap.Error(err))
-		metrics.TasksTotal.WithLabelValues("failure").Inc()
+		var taskErr error
+		if errors.Is(err, apperrors.ErrCircuitOpen) {
+			w.logger.Error(taskCtx, "bank circuit breaker open",
+				zap.Error(fmt.Errorf("%w", &apperrors.TaskError{TaskID: task.TaskID, Stage: "bank", Err: err})),
+			)
+			taskErr = &apperrors.TaskError{TaskID: task.TaskID, Stage: "bank", Err: err}
+		} else {
+			w.logger.Error(taskCtx, "bank call failed after retries",
+				zap.Error(fmt.Errorf("%w", &apperrors.TaskError{TaskID: task.TaskID, Stage: "bank", Err: err})),
+			)
+			taskErr = &apperrors.TaskError{TaskID: task.TaskID, Stage: "bank", Err: err}
+		}
+		_ = taskErr // used for structured logging above; result reflects failure
 		result.Status = domain.TaskStatusFailure
 	} else {
 		w.logger.Info(taskCtx, "bank call succeeded", zap.String("txn_ref", txnRef))
-		w.metrics.TasksTotal.WithLabelValues("success").Inc()
 		result.Status = domain.TaskStatusSuccess
 		result.BankTxnRef = txnRef
 		paymentSucceeded = true // WEEK 2: mark for reservation completion
 	}
+
 
 	// ── STEP 4: Report Result to C2 ───────────────────────────────────────
 	err = w.safeReportResult(ctx, task.TaskID, result)
@@ -236,14 +294,18 @@ func (w *WorkerServiceImpl) safeReportResult(
 ) error {
 	if _, revoked := w.revokedTasks.Load(taskID); revoked {
 		w.logger.Warn(ctx, "task revoked mid-execution — discarding result")
-		w.metrics.TasksTotal.WithLabelValues("revoked").Inc()
 		return nil
 	}
 
 	// --- WEEK 2 ADDITION: Outbox-backed ReportResult ---
 	// Try direct delivery first; fall back to outbox on failure.
 	if err := w.reportResult(ctx, result); err != nil {
-		w.logger.Warn(ctx, "direct ReportResult failed, buffering in outbox", zap.Error(err))
+		if isDeadlineExceeded(err) {
+			w.metrics.RecordDeadlineExceeded("outbox")
+			w.logger.Error(ctx, "ReportResult deadline exceeded, buffering in outbox", zap.Error(err))
+		} else {
+			w.logger.Warn(ctx, "direct ReportResult failed, buffering in outbox", zap.Error(err))
+		}
 		// Convert domain result to proto for outbox storage
 		pbResult := &pb.TaskResult{
 			TaskId:   result.TaskID,
@@ -263,10 +325,6 @@ func (w *WorkerServiceImpl) safeReportResult(
 
 func (w *WorkerServiceImpl) RevokeTask(ctx context.Context, taskID string) error {
 	w.revokedTasks.Store(taskID, true)
-	// We use the raw metrics from internal/metrics for global counters if needed,
-	// or update NewMetrics to include it. For now, let's just use the field if it existed.
-	// Wait, RevokedTasksTotal was NOT in the NewMetrics struct. I should add it.
-	w.metrics.RecordTaskRevoked()
 	w.logger.Warn(ctx, "task marked revoked")
 
 	// --- WEEK 2 ADDITION: Hard cancellation ---
@@ -303,3 +361,10 @@ func (w *WorkerServiceImpl) Stats() domain.WorkerStats {
 		// Epoch will be filled by the heartbeat client from its tracker
 	}
 }
+
+// isDeadlineExceeded reports whether err wraps context.DeadlineExceeded.
+// Used to distinguish timed-out calls from other transient failures.
+func isDeadlineExceeded(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+

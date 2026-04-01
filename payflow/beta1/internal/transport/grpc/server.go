@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"runtime/debug"
 	"time"
 
 	"go.uber.org/zap"
@@ -16,6 +15,7 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
+	"github.com/your-org/payflow/worker/internal/interceptor"
 	"github.com/your-org/payflow/worker/internal/service"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
@@ -28,20 +28,27 @@ type Server struct {
 	service  service.WorkerService
 }
 
-func NewServer(svc service.WorkerService, logger *zap.Logger) (*Server, error) {
+func NewServer(svc service.WorkerService, logger *zap.Logger, serverOptions ...grpc.ServerOption) (*Server, error) {
 	s := &Server{
 		logger:  logger,
 		service: svc,
 	}
+	
 	opts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(s.loggingInterceptor, s.recoveryInterceptor),
-		grpc.ChainStreamInterceptor(s.streamLoggingInterceptor, s.streamRecoveryInterceptor),
+		grpc.ChainUnaryInterceptor(
+			interceptor.UnaryServerVersion(logger),
+		),
+		grpc.ChainStreamInterceptor(
+			interceptor.StreamServerVersion(logger),
+		),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: 15 * time.Second,
 			Time:              5 * time.Second,
 			Timeout:           1 * time.Second,
 		}),
 	}
+	opts = append(opts, serverOptions...)
+	
 	s.grpc = grpc.NewServer(opts...)
 	s.health = health.NewServer()
 	grpc_health_v1.RegisterHealthServer(s.grpc, s.health)
@@ -87,40 +94,6 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) loggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	start := time.Now()
-	resp, err := handler(ctx, req)
-	s.logger.Info("gRPC unary call", zap.String("method", info.FullMethod), zap.Duration("duration", time.Since(start)), zap.Error(err))
-	return resp, err
-}
-
-func (s *Server) recoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("panic in gRPC handler", zap.String("method", info.FullMethod), zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
-			err = status.Errorf(codes.Internal, "internal server error")
-		}
-	}()
-	return handler(ctx, req)
-}
-
-func (s *Server) streamLoggingInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	start := time.Now()
-	s.logger.Info("gRPC stream started", zap.String("method", info.FullMethod))
-	err := handler(srv, ss)
-	s.logger.Info("gRPC stream ended", zap.String("method", info.FullMethod), zap.Duration("duration", time.Since(start)), zap.Error(err))
-	return err
-}
-
-func (s *Server) streamRecoveryInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("panic in gRPC stream", zap.String("method", info.FullMethod), zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
-			err = status.Errorf(codes.Internal, "internal server error")
-		}
-	}()
-	return handler(srv, ss)
-}
 // WorkerGRPCService implements the server-side of worker.proto (RevokeTask).
 type WorkerGRPCService struct {
 	pb.UnimplementedWorkerManagementServer

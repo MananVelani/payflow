@@ -5,80 +5,59 @@ import (
 	"errors"
 	"log/slog"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/your-org/payflow/worker/internal/outbox"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
-func TestOutbox_Enqueue(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	o := outbox.New(nil, logger)
-
-	res := &pb.TaskResult{TaskId: "t1"}
-	if !o.Enqueue(res) {
-		t.Fatal("failed to enqueue")
-	}
-
-	if o.QueueDepth() != 1 {
-		t.Fatalf("expected depth 1, got %d", o.QueueDepth())
-	}
-}
-
-func TestOutbox_RelaySuccess(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	var called atomic.Int32
+func TestOutbox_CrashResilience(t *testing.T) {
+	// Setup
+	store := outbox.NewMemoryStore()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	
-	reportFn := func(ctx context.Context, result *pb.TaskResult) (*pb.ResultAck, error) {
-		called.Add(1)
+	// Track calls to report
+	var callCount int
+	var shouldFail bool
+	
+	mockReport := func(ctx context.Context, result *pb.TaskResult) (*pb.ResultAck, error) {
+		callCount++
+		if shouldFail {
+			return nil, errors.New("C2 unavailable")
+		}
 		return &pb.ResultAck{Acknowledged: true}, nil
 	}
 
-	o := outbox.New(reportFn, logger)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	o := outbox.New(mockReport, store, 10*time.Millisecond, 1*time.Millisecond, 100, 0, nil, logger)
+	ctx := context.Background()
 
-	o.Enqueue(&pb.TaskResult{TaskId: "t1"})
+	// 1. Append 3 entries
+	o.Enqueue(&pb.TaskResult{TaskId: "task-1"})
+	o.Enqueue(&pb.TaskResult{TaskId: "task-2"})
+	o.Enqueue(&pb.TaskResult{TaskId: "task-3"})
+
+	// 2. Simulate flush failure
+	shouldFail = true
 	o.Start(ctx)
-
-	// Wait for relay (ticker is 2s, but we can't easily speed it up without refactoring)
-	// For testing, we might want to exported flush or use a shorter interval.
-	// But let's just wait a bit.
-	time.Sleep(3 * time.Second)
-
-	if called.Load() != 1 {
-		t.Fatalf("expected 1 call, got %d", called.Load())
-	}
-	if o.QueueDepth() != 0 {
-		t.Fatal("queue should be empty")
-	}
-}
-
-func TestOutbox_RelayRetry(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	var called atomic.Int32
 	
-	reportFn := func(ctx context.Context, result *pb.TaskResult) (*pb.ResultAck, error) {
-		called.Add(1)
-		return nil, errors.New("temporary failure")
-	}
+	// Wait for a few flush attempts
+	time.Sleep(50 * time.Millisecond)
+	
+	// Assert all 3 entries are still Pending
+	pending, err := store.Pending(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(pending), "Entries should remain in store on failure")
 
-	o := outbox.New(reportFn, logger)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// 3. Simulate successful flush
+	shouldFail = false
+	
+	// Wait for success
+	assert.Eventually(t, func() bool {
+		pending, _ := store.Pending(ctx)
+		return len(pending) == 0
+	}, 1*time.Second, 100*time.Millisecond, "Outbox should eventually drain on success")
 
-	o.Enqueue(&pb.TaskResult{TaskId: "t1"})
-	o.Start(ctx)
-
-	time.Sleep(3 * time.Second)
-
-	// Since it fails, it should stay in queue and retry
-	if called.Load() < 1 {
-		t.Fatal("should have attempted at least once")
-	}
-	if o.QueueDepth() != 1 {
-		t.Fatal("queue should NOT be empty")
-	}
+	assert.GreaterOrEqual(t, callCount, 3, "Should have attempted to send at least 3 messages")
 }

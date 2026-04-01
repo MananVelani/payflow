@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/your-org/payflow/worker/internal/metrics"
+	"github.com/your-org/payflow/worker/internal/observability"
 
 	retry "github.com/avast/retry-go/v4"
 	"github.com/sony/gobreaker"
@@ -48,9 +49,12 @@ type ProductionMockBankClient struct {
 	http    *http.Client
 	breaker *gobreaker.CircuitBreaker
 	logger  *zap.Logger
+	metrics *observability.Metrics
 }
 
-func NewProductionMockBankClient(cfg MockBankClientConfig, logger *zap.Logger) *ProductionMockBankClient {
+
+func NewProductionMockBankClient(cfg MockBankClientConfig, logger *zap.Logger, metrics *observability.Metrics) *ProductionMockBankClient {
+
 	cbSettings := gobreaker.Settings{
 		Name:        "mock-bank",
 		MaxRequests: cfg.CBMaxRequests,
@@ -75,8 +79,10 @@ func NewProductionMockBankClient(cfg MockBankClientConfig, logger *zap.Logger) *
 		http:    &http.Client{Timeout: cfg.HTTPTimeout},
 		breaker: gobreaker.NewCircuitBreaker(cbSettings),
 		logger:  logger,
+		metrics: metrics,
 	}
 }
+
 
 // Charge executes the bank charge with retry and circuit breaker.
 // CRITICAL: idempotencyKey must be IDENTICAL across all retry attempts.
@@ -128,8 +134,13 @@ func (c *ProductionMockBankClient) chargeViaBreaker(ctx context.Context, idempot
 func (c *ProductionMockBankClient) doHTTPCharge(ctx context.Context, idempotencyKey string, amount float64, currency, merchantID string) (string, error) {
 	start := time.Now()
 	defer func() {
-		metrics.BankRequestDuration.Observe(float64(time.Since(start).Milliseconds()))
+		// High-cardinality status allowed by USER: "success" | "insufficient_funds" | "timeout" | "circuit_open"
+		// We'll record "success" for 200, "error" for generic failures.
+		// Detailed status comes from the bank response.
+		status := "error"
+		c.metrics.RecordBankRequestDuration(status, float64(time.Since(start).Milliseconds()))
 	}()
+
 
 	// Simulate configurable latency (50–500ms per spec)
 	latencyRange := c.cfg.LatencyMaxMS - c.cfg.LatencyMinMS

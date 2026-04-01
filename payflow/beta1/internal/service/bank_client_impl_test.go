@@ -8,7 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
+	"github.com/your-org/payflow/worker/internal/observability"
 )
+
 
 func TestMockBankClient_FailsAfterRetries(t *testing.T) {
 	logger := zaptest.NewLogger(t)
@@ -18,7 +20,8 @@ func TestMockBankClient_FailsAfterRetries(t *testing.T) {
 		CBMaxRequests: 3, CBInterval: 10 * time.Second,
 		CBTimeout: 5 * time.Second, CBMinRequests: 1,
 	}
-	client := NewProductionMockBankClient(cfg, logger)
+	metrics := observability.NewMetrics()
+	client := NewProductionMockBankClient(cfg, logger, metrics)
 	_, err := client.Charge(context.Background(), "idem-key-001", 100.0, "USD", "merchant-1")
 	assert.Error(t, err, "expected failure with 100% fail rate")
 }
@@ -31,8 +34,10 @@ func TestMockBankClient_CircuitBreakerOpens(t *testing.T) {
 		CBMaxRequests: 1, CBInterval: time.Second,
 		CBTimeout: time.Second, CBMinRequests: 3,
 	}
-	client := NewProductionMockBankClient(cfg, logger)
+	metrics := observability.NewMetrics()
+	client := NewProductionMockBankClient(cfg, logger, metrics)
 	for i := 0; i < 10; i++ {
+
 		_, _ = client.Charge(context.Background(), "idem-cb-test", 50.0, "USD", "m001")
 	}
 	start := time.Now()

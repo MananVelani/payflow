@@ -18,8 +18,13 @@ type LogClientImpl struct {
 }
 
 // NewLogClientImpl dials C4 and returns a ready LogClientImpl.
-func NewLogClientImpl(addr string) (*LogClientImpl, error) {
-	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func NewLogClientImpl(addr string, dialOptions ...grpc.DialOption) (*LogClientImpl, error) {
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+	opts = append(opts, dialOptions...)
+	
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial C4 at %s: %w", addr, err)
 	}

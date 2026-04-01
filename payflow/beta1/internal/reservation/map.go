@@ -1,10 +1,14 @@
 package reservation
 
 import (
-	"errors"
+	"context"
 	"sync"
 	"time"
+
+	apperrors "github.com/your-org/payflow/worker/internal/errors"
 )
+
+
 
 // State represents the lifecycle of an idempotency key within this worker instance.
 type State int
@@ -21,34 +25,28 @@ type entry struct {
 	createdAt time.Time
 }
 
-// ErrAlreadyInProgress is returned when a goroutine tries to reserve a key
-// that another goroutine in this binary is already processing.
-var ErrAlreadyInProgress = errors.New("reservation: key already in progress on this worker")
+// ErrAlreadyInProgress is kept for backward-compat but now wraps the canonical sentinel.
+var ErrAlreadyInProgress = apperrors.ErrIdempotentKey
 
-// Map is a thread-safe, in-process idempotency reservation store.
-// It is NOT a replacement for C4 — it is a local guard within a single worker binary.
-// TTL-based cleanup prevents unbounded memory growth.
-type Map struct {
+// LocalStore is a thread-safe, in-process idempotency reservation store.
+type LocalStore struct {
 	mu      sync.Mutex
 	entries map[string]*entry
 	ttl     time.Duration // how long to keep completed entries
 }
 
-// New returns a Map with the given TTL for completed entries.
-// Recommended TTL: 5 * MAX_TASK_DURATION to cover all retry windows.
-func New(ttl time.Duration) *Map {
-	m := &Map{
+
+// NewLocalStore returns a LocalStore with the given TTL for completed entries.
+func NewLocalStore(ttl time.Duration) *LocalStore {
+	return &LocalStore{
 		entries: make(map[string]*entry),
 		ttl:     ttl,
 	}
-	return m
 }
 
+
 // Reserve attempts to transition key from NotStarted → InProgress.
-// Returns ErrAlreadyInProgress if the key is already InProgress.
-// Returns nil if the reservation was successfully acquired.
-// The caller MUST call Complete or Release when done.
-func (m *Map) Reserve(key string) error {
+func (m *LocalStore) Reserve(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -56,21 +54,19 @@ func (m *Map) Reserve(key string) error {
 	if exists {
 		switch e.state {
 		case StateInProgress:
-			return ErrAlreadyInProgress
+			return false, nil
 		case StateCompleted:
-			// Already done — caller should have hit C4 cache; let it through
-			// C4 is the authority; we just surface the local state
-			return nil
+			return true, nil
 		}
 	}
 
 	m.entries[key] = &entry{state: StateInProgress, createdAt: time.Now()}
-	return nil
+	return true, nil
 }
 
+
 // Complete transitions key from InProgress → Completed.
-// Call this after a successful bank response AND after reporting to C2.
-func (m *Map) Complete(key string) {
+func (m *LocalStore) Complete(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if e, ok := m.entries[key]; ok {
@@ -78,16 +74,18 @@ func (m *Map) Complete(key string) {
 	}
 }
 
-// Release removes a key reservation. Call this on bank failure or task revocation
-// so the key can be retried by another goroutine or worker.
-func (m *Map) Release(key string) {
+
+// Release removes a key reservation.
+func (m *LocalStore) Release(ctx context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.entries, key)
+	return nil
 }
 
-// StateOf returns the current state of a key. Used for debugging and metrics.
-func (m *Map) StateOf(key string) State {
+
+// StateOf returns the current state of a key.
+func (m *LocalStore) StateOf(key string) State {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.entries[key]
@@ -97,9 +95,9 @@ func (m *Map) StateOf(key string) State {
 	return e.state
 }
 
+
 // Cleanup removes completed entries older than the configured TTL.
-// Call this periodically from a background goroutine (e.g., every 30 seconds).
-func (m *Map) Cleanup() int {
+func (m *LocalStore) Cleanup() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cutoff := time.Now().Add(-m.ttl)
@@ -113,9 +111,11 @@ func (m *Map) Cleanup() int {
 	return removed
 }
 
-// Size returns the current number of tracked keys. Used for the Prometheus gauge.
-func (m *Map) Size() int {
+
+// Size returns the current number of tracked keys.
+func (m *LocalStore) Size() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.entries)
 }
+

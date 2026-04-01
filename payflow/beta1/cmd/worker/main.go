@@ -13,17 +13,21 @@ import (
 	"go.uber.org/zap"
 	"log/slog"
 
-	"github.com/your-org/payflow/worker/config"
+	"github.com/your-org/payflow/worker/internal/config"
+	"github.com/your-org/payflow/worker/internal/concurrency"
+	"github.com/your-org/payflow/worker/internal/health"
+	"github.com/your-org/payflow/worker/internal/interceptor"
 	"github.com/your-org/payflow/worker/internal/logger"
 	"github.com/your-org/payflow/worker/internal/metrics"
-	"github.com/your-org/payflow/worker/internal/reservation"
-	"github.com/your-org/payflow/worker/internal/outbox"
-	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/observability"
+	"github.com/your-org/payflow/worker/internal/outbox"
+	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/service"
 	"github.com/your-org/payflow/worker/internal/stream"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
+	"google.golang.org/grpc"
 	"sync"
+	"sync/atomic"
 )
 
 func main() {
@@ -67,11 +71,30 @@ func run() error {
 		}
 	}()
 
+	// --- WEEK 2 ADDITION: Interceptors ---
+	obsLog := observability.NewLogger(log)
+	obsMetrics := observability.NewMetrics()
+
+	clientUnaryChain := grpc.WithChainUnaryInterceptor(
+		interceptor.UnaryClientAuth(cfg.WorkerToken),
+		interceptor.UnaryClientDeadline(200*time.Millisecond),
+	)
+	clientStreamChain := grpc.WithChainStreamInterceptor(
+		interceptor.StreamClientAuth(cfg.WorkerToken),
+	)
+
 	// --- CP-7: Connect with Retry + Keepalive ──────────────────
-	// We establish a long-lived, keepalive-enabled connection that automatically
-	// handles reconnects behind the scenes for the C2 clients.
-	rootCtx := context.Background() // base context for long-lived streams
-	conn, err := stream.ConnectWithRetry(rootCtx, cfg.CoordinatorAddr, log)
+	rootCtx := context.Background()
+	conn, err := stream.ConnectWithRetry(
+		rootCtx,
+		cfg.CoordinatorAddr,
+		cfg.KeepaliveTime,
+		cfg.KeepaliveTimeout,
+		cfg.ConnectRetryDelay,
+		log,
+		clientUnaryChain,
+		clientStreamChain,
+	)
 	if err != nil {
 		return fmt.Errorf("coordinator connection failed: %w", err)
 	}
@@ -79,7 +102,7 @@ func run() error {
 
 	c2Client := grpctransport.NewC2Client(conn, log)
 
-	c4Client, err := service.NewLogClientImpl(cfg.LogServiceAddr)
+	c4Client, err := service.NewLogClientImpl(cfg.LogServiceAddr, clientUnaryChain)
 	if err != nil {
 		return fmt.Errorf("failed to init C4 client: %w", err)
 	}
@@ -91,33 +114,89 @@ func run() error {
 		LatencyMinMS:  cfg.BankLatencyMinMS,
 		LatencyMaxMS:  cfg.BankLatencyMaxMS,
 		MaxAttempts:   uint(cfg.RetryMaxAttempts),
-		BaseDelayMS:   cfg.RetryBaseDelayMS,
+		BaseDelayMS:   int(cfg.RetryBaseDelay.Milliseconds()),
 		HTTPTimeout:   10 * time.Second,
 		CBMaxRequests: 5,
 		CBInterval:    10 * time.Second,
 		CBTimeout:     5 * time.Second,
 		CBMinRequests: 3,
 	}
-	bankClient := service.NewProductionMockBankClient(bankCfg, log)
+	bankClient := service.NewProductionMockBankClient(bankCfg, log, obsMetrics)
 
-	// --- WEEK 2 ADDITION: Reservation map ---
-	reservationMap := reservation.New(5 * time.Minute)
- 
-	// --- WEEK 2 ADDITION: In-memory outbox ---
-	// Wrap slog for the outbox (Section 7: will be upgraded to observability.Logger in CP-6)
+
+	// Log full configuration at startup for audit trail
+	obsLog.WithRaw().Info("worker configuration loaded",
+		zap.Int("max_concurrent_tasks", cfg.MaxConcurrentTasks),
+		zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+		zap.Int("retry_max_attempts", cfg.RetryMaxAttempts),
+		zap.Duration("retry_base_delay", cfg.RetryBaseDelay),
+		zap.Duration("retry_max_delay", cfg.RetryMaxDelay),
+		zap.Uint32("cb_max_requests", cfg.CBMaxRequests),
+		zap.Float64("cb_failure_threshold", cfg.CBFailureThreshold),
+		zap.Duration("cb_timeout", cfg.CBTimeout),
+		zap.Duration("keepalive_time", cfg.KeepaliveTime),
+		zap.Duration("keepalive_timeout", cfg.KeepaliveTimeout),
+		zap.Duration("connect_retry_delay", cfg.ConnectRetryDelay),
+		zap.Duration("outbox_flush_interval", cfg.OutboxFlushInterval),
+		zap.Int("outbox_max_size", cfg.OutboxMaxSize),
+		zap.String("health_port", cfg.HealthPort),
+		zap.String("coordinator_addr", cfg.CoordinatorAddr),
+		zap.Int("grpc_port", cfg.GRPCPort),
+	)
+
+	// --- WEEK 2 ADDITION: Reservation Store initialization ---
+	var resStore reservation.Store
+	localRes := reservation.NewLocalStore(cfg.RetryMaxDelay * 5)
+	
+	if cfg.ReservationRedisURL != "" {
+		redisRes, err := reservation.NewRedisStore(cfg.ReservationRedisURL)
+		if err != nil {
+			log.Error("reservation: failed to connect to Redis, falling back to LocalStore only", zap.Error(err))
+			resStore = localRes
+		} else {
+			log.Info("reservation: using TieredStore (L1: Local, L2: Redis)")
+			resStore = reservation.NewTieredStore(localRes, redisRes)
+			defer resStore.(interface{ Close() error }).Close()
+		}
+	} else {
+		log.Warn("reservation: RESERVATION_REDIS_URL not set! running without distributed reservation — not safe for multi-replica deployments")
+		resStore = localRes
+	}
+
+
+	// --- WEEK 2 ADDITION: Outbox store initialization ---
 	slogLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	outboxBuf := outbox.New(c2Client.ReportRawResult, slogLogger)
-	// --- END WEEK 2 ADDITION ---
+	var outboxStore outbox.Store
+	if cfg.OutboxDBPath != "" {
+		bs, err := outbox.NewBadgerStore(cfg.OutboxDBPath)
+		if err != nil {
+			log.Error("outbox: failed to initialize BadgerStore, falling back to MemoryStore", zap.Error(err))
+			outboxStore = outbox.NewMemoryStore()
+		} else {
+			outboxStore = bs
+		}
+	} else {
+		log.Warn("outbox: OUTBOX_DB_PATH not set, falling back to MemoryStore (non-durable)")
+		outboxStore = outbox.NewMemoryStore()
+	}
+	defer outboxStore.Close()
+
+	outboxBuf := outbox.New(c2Client.ReportRawResult, outboxStore, cfg.OutboxFlushInterval, cfg.RetryBaseDelay, cfg.OutboxMaxSize, cfg.MaxTaskDuration, metrics.TaskDeadlineExceededTotal, slogLogger)
+
+
 
 	// --- WEEK 2 ADDITION: Concurrency ---
-	sem := concurrency.NewTaskSemaphore(int64(cfg.MaxConcurrentTasks))
+	sem := concurrency.NewTaskSemaphore(
+		cfg.MaxConcurrentTasks,
+		outboxStore,
+		cfg.MaxTaskDuration,
+		obsMetrics.WorkerSaturation,
+		obsMetrics.OrphanedLeaseCount,
+		slogLogger,
+	)
+
 	registry := concurrency.NewTaskRegistry()
 	var wg sync.WaitGroup // for task draining
-	// --- END WEEK 2 ADDITION ---
-
-	// --- WEEK 2 ADDITION: Observability ---
-	obsLog := observability.NewLogger(log)
-	// --- END WEEK 2 ADDITION ---
 
 	workerSvc := service.NewWorkerServiceImpl(
 		bankClient,
@@ -125,15 +204,31 @@ func run() error {
 		c2Client.ReportResult,
 		obsLog, // WEEK 2: upgraded to contextual logger
 		cfg,
-		reservationMap, // WEEK 2 ADDITION
-		outboxBuf,      // WEEK 2 ADDITION
-		sem,           // WEEK 2 ADDITION
-		registry,       // WEEK 2 ADDITION
-		&wg,            // WEEK 2 ADDITION: for graceful shutdown tracking
+		resStore,
+		outboxBuf,
+		sem,
+		registry,
+		&wg,
+		obsMetrics,
 	)
 
+
+
+	// --- Server Interceptors ---
+	recoveryU := interceptor.UnaryServerRecovery(obsLog)
+	loggingU := interceptor.UnaryServerLogging(obsLog)
+	metricsU := interceptor.UnaryServerMetrics(obsMetrics)
+
+	recoveryS := interceptor.StreamServerRecovery(obsLog)
+	loggingS := interceptor.StreamServerLogging(obsLog)
+
 	// Start gRPC server
-	grpcServer, err := grpctransport.NewServer(workerSvc, log)
+	grpcServer, err := grpctransport.NewServer(
+		workerSvc,
+		log,
+		grpc.ChainUnaryInterceptor(recoveryU, loggingU, metricsU),
+		grpc.ChainStreamInterceptor(recoveryS, loggingS),
+	)
 	if err != nil {
 		return fmt.Errorf("gRPC server init: %w", err)
 	}
@@ -142,6 +237,26 @@ func run() error {
 		return fmt.Errorf("gRPC listen: %w", err)
 	}
 	log.Info("gRPC server bound", zap.Int("port", assignedPort))
+
+	var grpcReady atomic.Bool
+	grpcReady.Store(true)
+
+	// --- CP-8: Health Checks ──────────────────
+	healthH := health.NewHandler(outboxBuf.IsRunning, stream.Ready(), grpcReady.Load)
+	healthMux := http.NewServeMux()
+	healthMux.HandleFunc("/healthz", healthH.Healthz)
+	healthMux.HandleFunc("/readyz", healthH.Readyz)
+	healthServer := &http.Server{
+		Addr:    fmt.Sprintf(":%s", cfg.HealthPort),
+		Handler: healthMux,
+	}
+	go func() {
+		log.Info("health server starting", zap.String("port", cfg.HealthPort))
+		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("health server error", zap.Error(err))
+		}
+	}()
+	// --- END CP-8 ---
 
 	grpcErrCh := make(chan error, 1)
 	go func() { grpcErrCh <- grpcServer.Serve() }()
@@ -161,7 +276,7 @@ func run() error {
 	}
 	
 	// Run the heartbeat loop with infinite retry
-	go stream.RegisterWithRetry(ctx, "heartbeat", registerFn, log)
+	go stream.RegisterWithRetry(ctx, "heartbeat", registerFn, cfg.ConnectRetryDelay, log)
 
 	// --- WEEK 2 ADDITION: Outbox relay ---
 	outboxBuf.Start(ctx)
@@ -174,19 +289,20 @@ func run() error {
 		for {
 			select {
 			case <-ticker.C:
-				n := reservationMap.Cleanup()
+				n := localRes.Cleanup()
 				if n > 0 {
-					slog.Debug("reservation: cleaned up completed entries", "count", n)
+					log.Debug("reservation: cleaned up local entries", zap.Int("count", n))
 				}
-			case <-ctx.Done(): // ctx is the worker's root context
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+
 	// --- END WEEK 2 ADDITION ---
 
 	// --- WEEK 2 ADDITION: Graceful Shutdown ---
-	go concurrency.GracefulShutdown(ctx, &wg, slogLogger)
+	go concurrency.GracefulShutdown(ctx, &wg, cfg.ShutdownTimeout, slogLogger)
 	// --- END WEEK 2 ADDITION ---
 
 	// Wait for shutdown signal
@@ -211,6 +327,10 @@ func run() error {
 	defer shutdownCancel()
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		log.Warn("metrics server shutdown", zap.Error(err))
+	}
+
+	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+		log.Warn("health server shutdown", zap.Error(err))
 	}
 
 	log.Info("worker service stopped cleanly", zap.String("worker_id", workerID))

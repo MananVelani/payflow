@@ -21,6 +21,7 @@ type Task struct {
 	MerchantID     string     `json:"merchant_id"`
 	Epoch          int64      `json:"epoch"`
 	ReceivedAt     time.Time  `json:"received_at"`
+	DeadlineUnixMs int64      `json:"deadline_unix_ms"` // Unix milliseconds; 0 means no deadline
 }
 
 // PaymentResult mirrors proto/worker.proto PaymentResult message exactly.

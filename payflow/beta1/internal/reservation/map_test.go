@@ -1,24 +1,35 @@
 package reservation_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/your-org/payflow/worker/internal/reservation"
 )
 
-func TestMap_Reserve(t *testing.T) {
-	m := reservation.New(1 * time.Minute)
+func TestLocalStore_Reserve(t *testing.T) {
+	m := reservation.NewLocalStore(1 * time.Minute)
+	ctx := context.Background()
 	key := "test-key"
+	ttl := 1 * time.Minute
 
 	// 1. First reservation should succeed
-	if err := m.Reserve(key); err != nil {
+	ok, err := m.Reserve(ctx, key, ttl)
+	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true, got false")
 	}
 
 	// 2. Immediate duplicate should fail
-	if err := m.Reserve(key); err != reservation.ErrAlreadyInProgress {
-		t.Fatalf("expected ErrAlreadyInProgress, got %v", err)
+	ok, err = m.Reserve(ctx, key, ttl)
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected false, got true")
 	}
 
 	// 3. Status should be InProgress
@@ -27,11 +38,13 @@ func TestMap_Reserve(t *testing.T) {
 	}
 }
 
-func TestMap_Complete(t *testing.T) {
-	m := reservation.New(1 * time.Minute)
+func TestLocalStore_Complete(t *testing.T) {
+	m := reservation.NewLocalStore(1 * time.Minute)
+	ctx := context.Background()
 	key := "test-key"
+	ttl := 1 * time.Minute
 
-	_ = m.Reserve(key)
+	_, _ = m.Reserve(ctx, key, ttl)
 	m.Complete(key)
 
 	// 1. Status should be Completed
@@ -40,17 +53,23 @@ func TestMap_Complete(t *testing.T) {
 	}
 
 	// 2. Reserve on completed should succeed (passes through to C4)
-	if err := m.Reserve(key); err != nil {
+	ok, err := m.Reserve(ctx, key, ttl)
+	if err != nil {
 		t.Fatalf("expected nil on completed key, got %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true on completed key, got false")
 	}
 }
 
-func TestMap_Release(t *testing.T) {
-	m := reservation.New(1 * time.Minute)
+func TestLocalStore_Release(t *testing.T) {
+	m := reservation.NewLocalStore(1 * time.Minute)
+	ctx := context.Background()
 	key := "test-key"
+	ttl := 1 * time.Minute
 
-	_ = m.Reserve(key)
-	m.Release(key)
+	_, _ = m.Reserve(ctx, key, ttl)
+	_ = m.Release(ctx, key)
 
 	// 1. Status should be NotStarted
 	if got := m.StateOf(key); got != reservation.StateNotStarted {
@@ -58,19 +77,24 @@ func TestMap_Release(t *testing.T) {
 	}
 
 	// 2. Should be able to reserve again
-	if err := m.Reserve(key); err != nil {
+	ok, err := m.Reserve(ctx, key, ttl)
+	if err != nil {
 		t.Fatalf("expected nil after release, got %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true after release, got false")
 	}
 }
 
-func TestMap_Cleanup(t *testing.T) {
+func TestLocalStore_Cleanup(t *testing.T) {
+	ctx := context.Background()
 	ttl := 100 * time.Millisecond
-	m := reservation.New(ttl)
+	m := reservation.NewLocalStore(ttl)
 	
-	m.Reserve("k1")
+	_, _ = m.Reserve(ctx, "k1", ttl)
 	m.Complete("k1")
 	
-	m.Reserve("k2") // k2 is InProgress, should NOT be cleaned up
+	_, _ = m.Reserve(ctx, "k2", ttl) // k2 is InProgress, should NOT be cleaned up
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -90,3 +114,4 @@ func TestMap_Cleanup(t *testing.T) {
 		t.Fatal("k2 should still be there")
 	}
 }
+
