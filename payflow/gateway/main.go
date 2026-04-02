@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // Week 4 Profiling Requirements
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type PaymentRequest struct {
 	IdempotencyKey string  `json:"idempotency_key"`
 }
 
+// Gateway proxies API requests caching the live gRPC connection details
 type Gateway struct {
 	leaderAddr string
 	conn       *grpc.ClientConn
@@ -42,6 +44,7 @@ type Gateway struct {
 	mu         sync.Mutex
 }
 
+// initTracer establishes remote mapping with the local Jaeger UI deployment
 func initTracer() (*sdktrace.TracerProvider, error) {
 	// A05: C1 Distributed Tracing (Jaeger) using jaeger:14268 based on typical Docker compose layout
 	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
@@ -58,12 +61,12 @@ func initTracer() (*sdktrace.TracerProvider, error) {
 	)
 
 	otel.SetTracerProvider(tp)
-	// Propagator ensures trace_id is forwarded
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
 	return tp, nil
 }
 
+// NewGateway securely initializes memory logic wrapping generic coordinator targets
 func NewGateway(initialLeader string) *Gateway {
 	gw := &Gateway{
 		leaderAddr: initialLeader,
@@ -106,6 +109,12 @@ func (gw *Gateway) getClient() pb.PaymentGatewayClient {
 }
 
 func main() {
+	// Spin up standalone pprof server asynchronously 
+	go func() {
+		log.Println("Pprof monitoring server exposing on :6060")
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
+
 	tp, err := initTracer()
 	if err != nil {
 		log.Fatal(err)
