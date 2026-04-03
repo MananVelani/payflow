@@ -104,6 +104,10 @@ func (h *HeartbeatClient) RunSession(ctx context.Context, conn *grpc.ClientConn)
 			if err != nil {
 				return fmt.Errorf("heartbeat send failed: %w", err)
 			}
+			h.logger.Info("heartbeat sent", 
+				zap.Float32("load", stats.Load),
+				zap.Int64("processed", stats.TasksProcessedCount),
+			)
 			metrics.HeartbeatSentTotal.Inc()
 		}
 	}

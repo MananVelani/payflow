@@ -34,7 +34,7 @@ func makeTask(id, key string, epoch int64) *domain.Task {
 // C4 receives an idempotency check → C2 receives a SUCCESS result →
 // the outbox remains empty.
 func TestHappyPath(t *testing.T) {
-	h := NewHarness(t)
+	h := NewHarness(t, nil)
 
 	task := makeTask("task-happy-1", "idem-happy-1", 1)
 	h.SendTask(t, task)
@@ -54,7 +54,7 @@ func TestHappyPath(t *testing.T) {
 // The reservation store ensures exactly one execution proceeds; C4 is consulted
 // exactly once, and C2 receives exactly one result.
 func TestIdempotency(t *testing.T) {
-	h := NewHarness(t)
+	h := NewHarness(t, nil)
 
 	task1 := makeTask("task-idem-1", "idem-shared", 1)
 	task2 := makeTask("task-idem-2", "idem-shared", 1) // same key, different ID
@@ -88,7 +88,7 @@ func TestIdempotency(t *testing.T) {
 // The fence validator returns a *fence.ValidationError wrapping ErrEpochStale.
 // ExecuteTask bubbles this error back to the caller and does NOT report to C2.
 func TestEpochFencing(t *testing.T) {
-	h := NewHarness(t)
+	h := NewHarness(t, nil)
 
 	// First task with epoch=1 — must succeed.
 	t1 := makeTask("task-fence-1", "idem-fence-1", 1)
@@ -119,7 +119,7 @@ func TestEpochFencing(t *testing.T) {
 // The bank client's inner retry (MaxAttempts=5) handles the transient failures.
 // The test asserts the eventual SUCCESS and that the bank was called multiple times.
 func TestBankFailureRetry(t *testing.T) {
-	h := NewHarness(t)
+	h := NewHarness(t, nil)
 
 	// Bank fails twice, then succeeds on the third call.
 	h.BankHandler.SetFailCount(2)
@@ -140,7 +140,7 @@ func TestBankFailureRetry(t *testing.T) {
 // causing the outbox to buffer it.  After a flush cycle the outbox relay
 // succeeds via the outbox's own ReportFunc, and the outbox drains to zero.
 func TestOutboxDurability(t *testing.T) {
-	h := NewHarness(t)
+	h := NewHarness(t, nil)
 
 	// First 1 domain-level ReportResult calls return an error.
 	h.C2.SetDomainFailCount(1)

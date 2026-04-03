@@ -9,7 +9,7 @@ import (
 )
 
 func TestHandler_Healthz(t *testing.T) {
-	h := NewHandler(nil, nil, nil)
+	h := NewHandler(nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 
@@ -34,7 +34,7 @@ func TestHandler_Readyz(t *testing.T) {
 	readyCh := make(chan struct{})
 	var grpcReady atomic.Bool
 
-	h := NewHandler(outboxRunning.Load, readyCh, grpcReady.Load)
+	h := NewHandler(outboxRunning.Load, readyCh, grpcReady.Load, nil)
 
 	// Subtest 1: Initially not ready (gRPC not ready)
 	{

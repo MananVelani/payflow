@@ -35,6 +35,7 @@ type WorkerServiceImpl struct {
 
 	// Concurrency-safe revoke map
 	revokedTasks  sync.Map // key: task_id (string), value: true
+	inFlightIdempotency sync.Map // key: task_id (string), value: idempotency_key (string)
 
 	// Stats for heartbeat — all atomic for lock-free reads
 	activeTasks   atomic.Int64
@@ -61,8 +62,10 @@ type WorkerServiceImpl struct {
 	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
 	wg *sync.WaitGroup
 
-	// --- WEEK 2 ADDITION: Resilience ---
 	circuitBreaker *resilience.BankCircuitBreaker
+
+	// --- Checkpoint 7: Task-level retry tracker ---
+	retryTracker *RetryTracker
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -100,7 +103,6 @@ func NewWorkerServiceImpl(
 		taskRegistry:   registry,
 		wg:             wg,
 
-		// --- WEEK 2 ADDITION: Initialize circuit breaker ---
 		// We pass the raw zap logger to the external dependency.
 		circuitBreaker: resilience.NewBankCircuitBreaker(
 			cfg.CBMaxRequests,
@@ -108,6 +110,7 @@ func NewWorkerServiceImpl(
 			cfg.CBFailureThreshold,
 			logger.WithRaw(),
 		),
+		retryTracker: NewRetryTracker(cfg.RetryTaskMaxAttempts),
 	}
 }
 
@@ -116,11 +119,25 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
 	w.wg.Add(1)
 	defer w.wg.Done()
-	// --- END WEEK 2 ADDITION ---
+	// --- Checkpoint 5: Early deadline derivation ---
+	taskCtx := ctx
+	if task.DeadlineUnixMs > 0 {
+		deadline := time.UnixMilli(task.DeadlineUnixMs)
+		var cancel context.CancelFunc
+		taskCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 
-	// --- WEEK 2 ADDITION: Concurrency & Revocation control ---
+	// --- Checkpoint 7: Record retry attempt ---
+	attempt := w.retryTracker.RecordAttempt(task.IdempotencyKey)
+	w.metrics.RecordTaskRetry(attempt)
+
 	// 1. Acquire semaphore slot (blocks if full)
-	if err := w.sem.Acquire(ctx); err != nil {
+	if err := w.sem.Acquire(taskCtx); err != nil {
+		if taskCtx.Err() != nil && errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+			w.metrics.RecordDeadlineExceeded("semaphore_wait")
+			return nil, taskCtx.Err()
+		}
 		if errors.Is(err, apperrors.ErrSemaphoreFull) {
 			w.logger.Warn(ctx, "semaphore at capacity", zap.Error(err))
 			return nil, fmt.Errorf("execute task %s: %w", task.TaskID, err)
@@ -130,19 +147,31 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	}
 	defer w.sem.Release()
 
-	// 2. Create cancellable context for THIS task's lifecycle
-	// --- WEEK 2 ADDITION: Inject Task ID for tracing ---
-	taskCtx, cancel := context.WithCancel(observability.WithTaskID(ctx, task.TaskID))
-	defer cancel()
+	// Track in-flight idempotency for revocation
+	w.inFlightIdempotency.Store(task.TaskID, task.IdempotencyKey)
+	defer w.inFlightIdempotency.Delete(task.TaskID)
+
+
+	// 2. Wrap context with task ID for tracing
+	taskCtx = observability.WithTaskID(taskCtx, task.TaskID)
+	// We no longer need another WithCancel here as taskCtx already has deadline/cancel
 
 	// 3. Register for hard revocation
-	w.taskRegistry.Register(task.TaskID, cancel)
-	defer w.taskRegistry.Deregister(task.TaskID)
-	// --- END WEEK 2 ADDITION ---
+	w.taskRegistry.Register(task.TaskID, func() { /* revocation cancel handled via taskCtx if possible, but registry needs a cancel func */ })
+	// Wait, the taskRegistry expects a cancel function.
+	// I should probably keep the WithCancel for revocation specifically if I want atomic cancel.
+	// But the prompt says "derive a deadline-bounded context AT THIS POINT".
 
-	// --- WEEK 2 ADDITION: Fencing token validation ---
-	// Placed FIRST: cheaper than a C4 network call; rejects zombie tasks immediately.
-	if err := w.epochValidator.ValidateAndUpdate(task.Epoch); err != nil {
+	// Let's refine the context wrapping.
+	revocationCtx, revocationCancel := context.WithCancel(taskCtx)
+	defer revocationCancel()
+	w.taskRegistry.Register(task.TaskID, revocationCancel)
+	defer w.taskRegistry.Deregister(task.TaskID)
+	
+	ctx = revocationCtx // use revocationCtx (which is taskCtx + revocation)
+
+	// 4. Fencing token validation
+	if err := w.epochValidator.ValidateAndUpdate(ctx, task.Epoch); err != nil {
 		var ve *fence.ValidationError
 		if errors.As(err, &ve) {
 			w.logger.Warn(taskCtx, "fencing: rejected stale task",
@@ -179,15 +208,9 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		}
 	}
 
-	// ── Deadline: wire task deadline into context ──────────────────────────
-	// Done AFTER reservation so the idempotency key is already held before
-	// we spend any of the task's time budget on actual work.
-	if task.DeadlineUnixMs > 0 {
-		deadline := time.UnixMilli(task.DeadlineUnixMs)
-		var deadlineCancel context.CancelFunc
-		ctx, deadlineCancel = context.WithDeadline(ctx, deadline)
-		defer deadlineCancel()
-	}
+	// Reservation handles IK-1 before we proceed further.
+	w.epoch = task.Epoch
+	// --- END CHECKPOINT 5 ---
 
 
 
@@ -273,11 +296,17 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 		}
 		_ = taskErr // used for structured logging above; result reflects failure
 		result.Status = domain.TaskStatusFailure
+
+		if !w.retryTracker.ShouldRetry(task.IdempotencyKey) {
+			w.logger.Warn(taskCtx, "task max retries exceeded, marking as permanent failure")
+			w.retryTracker.Clear(task.IdempotencyKey)
+		}
 	} else {
 		w.logger.Info(taskCtx, "bank call succeeded", zap.String("txn_ref", txnRef))
 		result.Status = domain.TaskStatusSuccess
 		result.BankTxnRef = txnRef
 		paymentSucceeded = true // WEEK 2: mark for reservation completion
+		w.retryTracker.Clear(task.IdempotencyKey)
 	}
 
 
@@ -293,7 +322,8 @@ func (w *WorkerServiceImpl) safeReportResult(
 	result *domain.PaymentResult,
 ) error {
 	if _, revoked := w.revokedTasks.Load(taskID); revoked {
-		w.logger.Warn(ctx, "task revoked mid-execution — discarding result")
+		w.logger.Info(ctx, "suppressing result for revoked task", zap.String("task_id", taskID))
+		w.metrics.RecordRevokedTaskSuppressed()
 		return nil
 	}
 
@@ -325,14 +355,19 @@ func (w *WorkerServiceImpl) safeReportResult(
 
 func (w *WorkerServiceImpl) RevokeTask(ctx context.Context, taskID string) error {
 	w.revokedTasks.Store(taskID, true)
-	w.logger.Warn(ctx, "task marked revoked")
+	w.metrics.RecordTaskRevoked()
 
-	// --- WEEK 2 ADDITION: Hard cancellation ---
-	if w.taskRegistry.Revoke(taskID) {
-		w.logger.Info(ctx, "hard revocation: cancelled active task context")
+	// 1. Mark revoked (done above)
+	// 2. Cancel active task
+	w.taskRegistry.Revoke(taskID)
+
+	// 3. Release reservation if possible
+	if ik, ok := w.inFlightIdempotency.Load(taskID); ok {
+		w.logger.Info(ctx, "releasing reservation for revoked task", zap.String("task_id", taskID))
+		_ = w.reservationStore.Release(ctx, ik.(string))
 	}
-	// --- END WEEK 2 ADDITION ---
 
+	w.logger.Warn(ctx, "task revocation sequence completed", zap.String("task_id", taskID))
 	return nil
 }
 
@@ -368,3 +403,13 @@ func isDeadlineExceeded(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
+
+// --- Testing Helpers ---
+
+func (w *WorkerServiceImpl) AcquireSemaphore(ctx context.Context) error {
+	return w.sem.Acquire(ctx)
+}
+
+func (w *WorkerServiceImpl) ReleaseSemaphore() {
+	w.sem.Release()
+}

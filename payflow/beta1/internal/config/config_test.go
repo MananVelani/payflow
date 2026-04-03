@@ -21,7 +21,7 @@ func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("LOG_SERVICE_ADDR", "localhost:8081")
 	t.Setenv("BANK_API_ADDR", "localhost:8082")
 
-	cfg, err := Load()
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("failed to load config: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("RETRY_MAX_ATTEMPTS", "10")
 	t.Setenv("CB_FAILURE_THRESHOLD", "0.8")
 
-	cfg, err := Load()
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("failed to load config: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestLoad_Errors(t *testing.T) {
 
 	// Test invalid integer
 	t.Setenv("MAX_CONCURRENT_TASKS", "not-an-int")
-	_, err := Load()
+	_, err := Load("")
 	if err == nil {
 		t.Error("expected error for invalid MAX_CONCURRENT_TASKS, got nil")
 	}
@@ -83,7 +83,7 @@ func TestLoad_Errors(t *testing.T) {
 	// Test invalid duration
 	t.Setenv("MAX_CONCURRENT_TASKS", "10")
 	t.Setenv("SHUTDOWN_TIMEOUT", "invalid-duration")
-	_, err = Load()
+	_, err = Load("")
 	if err == nil {
 		t.Error("expected error for invalid SHUTDOWN_TIMEOUT, got nil")
 	}

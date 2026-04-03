@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"log/slog"
 
@@ -30,15 +31,27 @@ import (
 	"sync/atomic"
 )
 
+var configPath string
+
 func main() {
-	if err := run(); err != nil {
+	rootCmd := &cobra.Command{
+		Use:   "worker",
+		Short: "PayFlow C3 Worker Service",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run()
+		},
+	}
+
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "path to config file (optional)")
+
+	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
-	cfg, err := config.Load()
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
@@ -144,6 +157,11 @@ func run() error {
 		zap.Int("grpc_port", cfg.GRPCPort),
 	)
 
+	// --- Checkpoint 2: Redis startup validation ---
+	if cfg.RequireRedis && cfg.ReservationRedisURL == "" {
+		log.Fatal("REQUIRE_REDIS=true but RESERVATION_REDIS_URL is not set — refusing to start in multi-replica mode")
+	}
+
 	// --- WEEK 2 ADDITION: Reservation Store initialization ---
 	var resStore reservation.Store
 	localRes := reservation.NewLocalStore(cfg.RetryMaxDelay * 5)
@@ -168,15 +186,16 @@ func run() error {
 	slogLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	var outboxStore outbox.Store
 	if cfg.OutboxDBPath != "" {
+		if err := os.MkdirAll(cfg.OutboxDBPath, 0750); err != nil {
+			return fmt.Errorf("outbox: failed to create data directory: %w", err)
+		}
 		bs, err := outbox.NewBadgerStore(cfg.OutboxDBPath)
 		if err != nil {
-			log.Error("outbox: failed to initialize BadgerStore, falling back to MemoryStore", zap.Error(err))
-			outboxStore = outbox.NewMemoryStore()
-		} else {
-			outboxStore = bs
+			return fmt.Errorf("outbox: failed to initialize BadgerStore: %w", err)
 		}
+		outboxStore = bs
 	} else {
-		log.Warn("outbox: OUTBOX_DB_PATH not set, falling back to MemoryStore (non-durable)")
+		log.Warn("outbox: OUTBOX_DB_PATH is empty, using MemoryStore (non-durable, tests ONLY)")
 		outboxStore = outbox.NewMemoryStore()
 	}
 	defer outboxStore.Close()
@@ -242,7 +261,12 @@ func run() error {
 	grpcReady.Store(true)
 
 	// --- CP-8: Health Checks ──────────────────
-	healthH := health.NewHandler(outboxBuf.IsRunning, stream.Ready(), grpcReady.Load)
+	healthH := health.NewHandler(outboxBuf.IsRunning, stream.Ready(), grpcReady.Load, func() error {
+		if cfg.ReservationRedisURL != "" {
+			return health.RedisHealthCheck(rootCtx, cfg.ReservationRedisURL)
+		}
+		return nil
+	})
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", healthH.Healthz)
 	healthMux.HandleFunc("/readyz", healthH.Readyz)

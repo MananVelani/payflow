@@ -1,6 +1,7 @@
 package fence
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 
@@ -44,8 +45,13 @@ func (e *ValidationError) Unwrap() error { return apperrors.ErrEpochStale }
 //
 // Design note: we allow equal epochs (same leader, same epoch) to handle the
 // case where C2 sends multiple tasks before incrementing. We only reject LESS THAN.
-func (v *EpochValidator) ValidateAndUpdate(incomingEpoch int64) error {
+func (v *EpochValidator) ValidateAndUpdate(ctx context.Context, incomingEpoch int64) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		current := v.lastSeenEpoch.Load()
 		if incomingEpoch < current {
 			return &ValidationError{

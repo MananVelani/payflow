@@ -3,21 +3,49 @@ package observability
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/your-org/payflow/worker/internal/metrics"
+	"strings"
 )
+
+const (
+	BankResultSuccess     = "success"
+	BankResultFailed      = "failed"
+	BankResultTimeout     = "timeout"
+	BankResultCircuitOpen = "circuit_open"
+	BankResultUnknown     = "unknown"
+)
+
+// NormalizeBankResult maps raw bank results to a finite set of label values.
+func NormalizeBankResult(raw string) string {
+	raw = strings.ToLower(raw)
+	switch raw {
+	case BankResultSuccess, BankResultFailed, BankResultTimeout, BankResultCircuitOpen:
+		return raw
+	}
+
+	if strings.Contains(raw, "timeout") || strings.Contains(raw, "deadline") {
+		return BankResultTimeout
+	}
+	if strings.Contains(raw, "circuit") {
+		return BankResultCircuitOpen
+	}
+	return BankResultUnknown
+}
 
 // Metrics provides a structured handle for Prometheus instrumentation.
 // It reuses the global variables from internal/metrics to avoid double-registration panics.
 type Metrics struct {
-	TasksTotal                *prometheus.CounterVec
-	ActiveTasks               prometheus.Gauge
-	BankRequestDuration       *prometheus.HistogramVec
-	TaskDuration              prometheus.Histogram
-	WorkerSaturation          prometheus.Gauge
-	RevokedTasksTotal         prometheus.Counter
-	OrphanedLeaseCount        prometheus.Gauge
-	GRPCServerHandledTotal    *prometheus.CounterVec
-	GRPCServerHandlingSeconds *prometheus.HistogramVec
-	TaskDeadlineExceededTotal *prometheus.CounterVec
+	TasksTotal                   *prometheus.CounterVec
+	ActiveTasks                  prometheus.Gauge
+	BankRequestDuration          *prometheus.HistogramVec
+	TaskDuration                 prometheus.Histogram
+	WorkerSaturation             prometheus.Gauge
+	RevokedTasksTotal            prometheus.Counter
+	RevokedResultSuppressedTotal prometheus.Counter
+	OrphanedLeaseCount           prometheus.Gauge
+	GRPCServerHandledTotal       *prometheus.CounterVec
+	GRPCServerHandlingSeconds    *prometheus.HistogramVec
+	TaskDeadlineExceededTotal    *prometheus.CounterVec
+	TaskRetryTotal               *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -28,10 +56,12 @@ func NewMetrics() *Metrics {
 		TaskDuration:              metrics.TaskDurationSeconds,
 		WorkerSaturation:          metrics.WorkerSaturation,
 		RevokedTasksTotal:         metrics.RevokedTasksTotal,
+		RevokedResultSuppressedTotal: metrics.RevokedResultSuppressedTotal,
 		OrphanedLeaseCount:        metrics.OrphanedLeaseCount,
 		GRPCServerHandledTotal:    metrics.GRPCServerHandledTotal,
 		GRPCServerHandlingSeconds: metrics.GRPCServerHandlingSeconds,
 		TaskDeadlineExceededTotal: metrics.TaskDeadlineExceededTotal,
+		TaskRetryTotal:            metrics.TaskRetryTotal,
 	}
 }
 
@@ -63,7 +93,7 @@ func (m *Metrics) RecordTaskDuration(seconds float64) {
 
 // RecordBankRequestDuration observes the bank API call duration.
 func (m *Metrics) RecordBankRequestDuration(result string, durationMs float64) {
-	m.BankRequestDuration.WithLabelValues(result).Observe(durationMs)
+	m.BankRequestDuration.WithLabelValues(NormalizeBankResult(result)).Observe(durationMs)
 }
 
 // RecordTaskRevoked increments the revoked counter.
@@ -71,8 +101,18 @@ func (m *Metrics) RecordTaskRevoked() {
 	m.RevokedTasksTotal.Inc()
 }
 
+// RecordRevokedTaskSuppressed increments the counter for discarded results.
+func (m *Metrics) RecordRevokedTaskSuppressed() {
+	m.RevokedResultSuppressedTotal.Inc()
+}
+
 // RecordDeadlineExceeded increments the deadline-exceeded counter for the given stage.
-// Valid stage values: "bank", "c4_log", "outbox".
+// Valid stage values: "semaphore_wait", "bank", "c4_log", "outbox".
 func (m *Metrics) RecordDeadlineExceeded(stage string) {
 	m.TaskDeadlineExceededTotal.WithLabelValues(stage).Inc()
+}
+
+// RecordTaskRetry increments the retry counter with the given attempt label.
+func (m *Metrics) RecordTaskRetry(attempt string) {
+	m.TaskRetryTotal.WithLabelValues(attempt).Inc()
 }

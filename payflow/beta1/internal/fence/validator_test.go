@@ -1,6 +1,7 @@
 package fence_test
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -10,7 +11,7 @@ import (
 
 func TestValidateAndUpdate_AcceptsHigherEpoch(t *testing.T) {
 	v := fence.NewEpochValidator()
-	if err := v.ValidateAndUpdate(10); err != nil {
+	if err := v.ValidateAndUpdate(context.Background(), 10); err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
 	if got := v.Epoch(); got != 10 {
@@ -20,16 +21,16 @@ func TestValidateAndUpdate_AcceptsHigherEpoch(t *testing.T) {
 
 func TestValidateAndUpdate_AcceptsEqualEpoch(t *testing.T) {
 	v := fence.NewEpochValidator()
-	_ = v.ValidateAndUpdate(5)
-	if err := v.ValidateAndUpdate(5); err != nil {
+	_ = v.ValidateAndUpdate(context.Background(), 5)
+	if err := v.ValidateAndUpdate(context.Background(), 5); err != nil {
 		t.Fatalf("equal epoch should be accepted, got %v", err)
 	}
 }
 
 func TestValidateAndUpdate_RejectsLowerEpoch(t *testing.T) {
 	v := fence.NewEpochValidator()
-	_ = v.ValidateAndUpdate(10)
-	err := v.ValidateAndUpdate(9)
+	_ = v.ValidateAndUpdate(context.Background(), 10)
+	err := v.ValidateAndUpdate(context.Background(), 9)
 	if err == nil {
 		t.Fatal("expected error for stale epoch, got nil")
 	}
@@ -51,7 +52,7 @@ func TestValidateAndUpdate_ConcurrentSafety(t *testing.T) {
 		wg.Add(1)
 		go func(epoch int64) {
 			defer wg.Done()
-			_ = v.ValidateAndUpdate(epoch) // some will fail; that is expected
+			_ = v.ValidateAndUpdate(context.Background(), epoch) // some will fail; that is expected
 		}(i)
 	}
 	wg.Wait()

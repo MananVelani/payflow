@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,8 +24,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/config"
+	"github.com/your-org/payflow/worker/internal/concurrency"
+	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 	"github.com/your-org/payflow/worker/internal/domain"
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/observability"
@@ -99,6 +101,7 @@ type MockC2 struct {
 	mu              sync.Mutex
 	results         []*domain.PaymentResult // written by both paths
 	domainFailCount atomic.Int32
+	logger          *zap.Logger
 }
 
 // ReportDomain is used as service.ReportResultFunc.
@@ -134,6 +137,36 @@ func (m *MockC2) ReportResult(_ context.Context, in *pbworker.TaskResult) (*pbwo
 	defer m.mu.Unlock()
 	m.results = append(m.results, r)
 	return &pbworker.ResultAck{Acknowledged: true}, nil
+}
+
+// RegisterWorker implements the gRPC WorkerManagement server method.
+func (m *MockC2) RegisterWorker(ctx context.Context, req *pbworker.RegisterRequest) (*pbworker.RegisterResponse, error) {
+	m.logger.Info("C2 received registration",
+		zap.String("worker_id", req.WorkerId),
+		zap.Int32("capacity", req.ProcessingCapacity))
+	return &pbworker.RegisterResponse{Success: true}, nil
+}
+
+// WorkerHeartbeat implements the bidi stream for heartbeats and logs pings for the demo.
+func (m *MockC2) WorkerHeartbeat(stream pbworker.WorkerManagement_WorkerHeartbeatServer) error {
+	for {
+		ping, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		m.logger.Warn("C2 received heartbeat",
+			zap.String("worker_id", ping.WorkerId),
+			zap.Float32("load", ping.Load),
+			zap.Int64("tasks", ping.TasksProcessedCount),
+			zap.Int64("epoch", ping.Epoch))
+		
+		err = stream.Send(&pbworker.HeartbeatAck{
+			Epoch: ping.Epoch,
+		})
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // SetDomainFailCount programs the mock to return an error for the next n
@@ -189,20 +222,21 @@ type Harness struct {
 	C2          *MockC2
 	C4          *MockC4
 	BankHandler *MockBankHandler
+	Config      *config.Config
 
 	worker      *service.WorkerServiceImpl
-	outboxStore *outbox.MemoryStore
+	outboxStore outbox.Store
 	outboxInst  *outbox.Outbox
 	grpcServer  *grpc.Server
 	bankServer  *httptest.Server
 	lis         *bufconn.Listener
 	cancel      context.CancelFunc
 	wg          *sync.WaitGroup
+	dbPath      string // temporary directory for BadgerDB
 }
 
-// NewHarness builds a fully-wired test harness and registers t.Cleanup(h.Close).
-// It is safe to call multiple times within the same test binary (e.g. -count=3).
-func NewHarness(t *testing.T) *Harness {
+// NewHarness builds a fully-wired test harness. If cfg is nil, defaults are used.
+func NewHarness(t *testing.T, customCfg *config.Config) *Harness {
 	t.Helper()
 
 	// Register Prometheus metrics exactly once per process.
@@ -212,7 +246,10 @@ func NewHarness(t *testing.T) *Harness {
 	lis := bufconn.Listen(bufSize)
 	grpcSrv := grpc.NewServer()
 
-	c2 := &MockC2{}
+	// ── 3. Observability (single logger for both C3 and Mocks) ────────────────
+	zapLogger, _ := zap.NewDevelopment() 
+	
+	c2 := &MockC2{logger: zapLogger}
 	c4 := &MockC4{}
 	pbworker.RegisterWorkerManagementServer(grpcSrv, c2)
 	pblog.RegisterPaymentLogServiceServer(grpcSrv, c4)
@@ -224,7 +261,7 @@ func NewHarness(t *testing.T) *Harness {
 		}
 	}()
 
-	// Dial the bufconn so LogClientImpl can call MockC4 over "gRPC".
+	// ── Dial bufconn for C4 Log Service ───────────────────────────────────────
 	dialFn := func(ctx context.Context, _ string) (net.Conn, error) {
 		return lis.DialContext(ctx)
 	}
@@ -235,12 +272,19 @@ func NewHarness(t *testing.T) *Harness {
 	)
 	require.NoError(t, err, "dial bufconn for C4")
 
+	// ── Dial bufconn for C2 Heartbeat ──────────────────────────────────────────
+	c2Conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(dialFn),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err, "dial bufconn for C2 heartbeat")
+
 	// ── 2. Mock bank HTTP server ──────────────────────────────────────────────
 	bankHandler := &MockBankHandler{}
 	bankServer := httptest.NewServer(bankHandler)
 
-	// ── 3. Observability (nop logger, real metrics on isolated registry) ──────
-	zapLogger := zap.NewNop()
+	// ── 3. Observability ─────────────────────────────────────────────────────
 	obsLogger := observability.NewLogger(zapLogger)
 	obsMetrics := observability.NewMetrics()
 
@@ -252,6 +296,7 @@ func NewHarness(t *testing.T) *Harness {
 		BankLatencyMinMS: 0,   // no artificial latency
 		BankLatencyMaxMS: 0,
 		MaxConcurrentTasks: 10,
+		HeartbeatInterval:  2 * time.Second,
 		MaxTaskDuration:    30 * time.Second,
 		ShutdownTimeout:    5 * time.Second,
 		// Outer retry (ExecuteWithRetry inside WorkerServiceImpl)
@@ -265,6 +310,20 @@ func NewHarness(t *testing.T) *Harness {
 		// Outbox
 		OutboxFlushInterval: 50 * time.Millisecond,
 		OutboxMaxSize:       100,
+		OutboxDBPath:        "", // Default to memory for most tests
+		// Week 3
+		RetryTaskMaxAttempts: 3,
+		RequireRedis:         false,
+	}
+
+	if customCfg != nil {
+		if customCfg.MaxConcurrentTasks > 0 {
+			cfg.MaxConcurrentTasks = customCfg.MaxConcurrentTasks
+		}
+		if customCfg.HeartbeatInterval > 0 {
+			cfg.HeartbeatInterval = customCfg.HeartbeatInterval
+		}
+		// ... add more as needed
 	}
 
 	// ── 5. Bank client ────────────────────────────────────────────────────────
@@ -273,7 +332,7 @@ func NewHarness(t *testing.T) *Harness {
 		FailRate:      0,
 		LatencyMinMS:  0,
 		LatencyMaxMS:  0,
-		MaxAttempts:   5,  // inner retry: up to 5 HTTP attempts
+		MaxAttempts:   5, // inner retry: up to 5 HTTP attempts
 		BaseDelayMS:   5,
 		HTTPTimeout:   5 * time.Second,
 		CBMaxRequests: 1000,
@@ -285,13 +344,24 @@ func NewHarness(t *testing.T) *Harness {
 
 	// ── 6. Storage dependencies ───────────────────────────────────────────────
 	resStore := reservation.NewLocalStore(5 * time.Minute)
-	outboxStore := outbox.NewMemoryStore()
+
+	// Support BadgerDB if requested via environment or a specialized constructor
+	var outboxStore outbox.Store
+	var dbPath string
+	if os.Getenv("USE_BADGER_TEST") == "true" {
+		dbPath, _ = os.MkdirTemp("", "c3-outbox-test-*")
+		store, err := outbox.NewBadgerStore(dbPath)
+		require.NoError(t, err)
+		outboxStore = store
+	} else {
+		outboxStore = outbox.NewMemoryStore()
+	}
 
 	// ── 7. Concurrency primitives ─────────────────────────────────────────────
 	taskWg := &sync.WaitGroup{}
 	sem := concurrency.NewTaskSemaphore(
 		cfg.MaxConcurrentTasks,
-		outboxStore, // MemoryStore satisfies LeaseStore
+		outboxStore.(concurrency.LeaseStore), // Both Memory and Badger satisfy this
 		cfg.MaxTaskDuration,
 		obsMetrics.WorkerSaturation,
 		obsMetrics.OrphanedLeaseCount,
@@ -332,11 +402,32 @@ func NewHarness(t *testing.T) *Harness {
 		obsMetrics,
 	)
 
+	// ── 10. Start Heartbeat (for live demo) ──────────────────────────────────
+	heartbeat := grpctransport.NewHeartbeatClient(
+		cfg.WorkerID, 50051, cfg.MaxConcurrentTasks,
+		cfg.HeartbeatInterval, workerImpl.Stats, zapLogger,
+	)
+	go func() {
+		// Infinite retry loop similar to main.go
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if err := heartbeat.RunSession(ctx, c2Conn); err != nil {
+					t.Logf("heartbeat session failed: %v", err)
+					time.Sleep(1 * time.Second)
+				}
+			}
+		}
+	}()
+
 	h := &Harness{
 		C2:          c2,
 		C4:          c4,
 		BankHandler: bankHandler,
 		worker:      workerImpl,
+		Config:      cfg,
 		outboxStore: outboxStore,
 		outboxInst:  outboxInst,
 		grpcServer:  grpcSrv,
@@ -344,6 +435,7 @@ func NewHarness(t *testing.T) *Harness {
 		lis:         lis,
 		cancel:      cancel,
 		wg:          taskWg,
+		dbPath:      dbPath,
 	}
 	t.Cleanup(h.Close)
 	return h
@@ -431,6 +523,11 @@ func (h *Harness) Close() {
 	h.cancel()
 	h.grpcServer.GracefulStop()
 	h.bankServer.Close()
+
+	if h.dbPath != "" {
+		os.RemoveAll(h.dbPath)
+	}
+
 	// Give in-flight ExecuteTask goroutines a moment to finish.
 	done := make(chan struct{})
 	go func() { h.wg.Wait(); close(done) }()

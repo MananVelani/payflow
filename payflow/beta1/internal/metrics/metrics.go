@@ -37,9 +37,19 @@ var (
 	RevokedTasksTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{Name: "worker_revoked_tasks_total", Help: "Tasks abandoned due to REVOKE from C2."},
 	)
+	RevokedResultSuppressedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{Name: "worker_revoked_result_suppressed_total", Help: "Results discarded because the task was revoked before delivery."},
+	)
 	TaskDeadlineExceededTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{Name: "worker_task_deadline_exceeded_total", Help: "Tasks that hit context.DeadlineExceeded, by stage."},
+		prometheus.CounterOpts{
+			Name: "worker_task_deadline_exceeded_total",
+			Help: "Tasks that hit context.DeadlineExceeded, by stage (semaphore_wait, bank, c4_log, outbox).",
+		},
 		[]string{"stage"},
+	)
+	TaskRetryTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "worker_task_retry_total", Help: "Total task-level retry attempts (re-dispatched by C2)."},
+		[]string{"attempt"},
 	)
 	OrphanedLeaseCount = prometheus.NewGauge(
 		prometheus.GaugeOpts{Name: "worker_orphaned_lease_count", Help: "Count of orphaned task leases recovered at startup."},
@@ -68,10 +78,12 @@ func Register() {
 		BankRetriesTotal,
 		HeartbeatSentTotal,
 		RevokedTasksTotal,
+		RevokedResultSuppressedTotal,
 		OrphanedLeaseCount,
 		GRPCServerHandledTotal,
 		GRPCServerHandlingSeconds,
 		TaskDeadlineExceededTotal,
+		TaskRetryTotal,
 	)
 }
 
