@@ -9,7 +9,7 @@ import (
 	"time"
 
 	// Update this module path to match your go.mod
-	pb "payflow/proto" 
+	paymentPb "payflow/proto/payment" 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -33,7 +33,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	grpcClient := pb.NewPaymentGatewayClient(conn)
+	grpcClient := paymentPb.NewPaymentGatewayClient(conn)
 
 	// 2. Set up the REST HTTP/2 server
 	http.HandleFunc("/v1/payments", func(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +52,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		resp, err := grpcClient.SubmitTask(ctx, &pb.SubmitTaskRequest{
+		resp, err := grpcClient.SubmitTask(ctx, &paymentPb.SubmitTaskRequest{
 			Epoch:          1, // Dummy epoch for Week 1
 			Amount:         req.Amount,
 			Currency:       req.Currency,
