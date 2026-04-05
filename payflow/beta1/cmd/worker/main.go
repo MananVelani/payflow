@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,7 +20,9 @@ import (
 	"github.com/your-org/payflow/worker/internal/config"
 	"github.com/your-org/payflow/worker/internal/concurrency"
 	"github.com/your-org/payflow/worker/internal/health"
+	"github.com/your-org/payflow/worker/internal/heartbeat"
 	"github.com/your-org/payflow/worker/internal/interceptor"
+	"github.com/your-org/payflow/worker/internal/loadreport"
 	"github.com/your-org/payflow/worker/internal/logger"
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/observability"
@@ -25,10 +30,9 @@ import (
 	"github.com/your-org/payflow/worker/internal/reservation"
 	"github.com/your-org/payflow/worker/internal/service"
 	"github.com/your-org/payflow/worker/internal/stream"
+	"github.com/your-org/payflow/worker/internal/tracing"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 	"google.golang.org/grpc"
-	"sync"
-	"sync/atomic"
 )
 
 var configPath string
@@ -83,6 +87,25 @@ func run() error {
 			log.Error("metrics server error", zap.Error(err))
 		}
 	}()
+
+	// --- Week 4: pprof endpoint ---
+	go func() {
+		log.Info("pprof enabled on :6060")
+		if ppErr := http.ListenAndServe(":6060", nil); ppErr != nil {
+			log.Debug("pprof server stopped", zap.Error(ppErr))
+		}
+	}()
+
+	// --- Week 4: Tracing init ---
+	tracingShutdown, tErr := tracing.Init(context.Background(), tracing.Config{
+		Enabled:     true,
+		ServiceName: "c3-worker",
+		Endpoint:    "jaeger:4317",
+	})
+	if tErr != nil {
+		log.Warn("tracing init failed — running without traces", zap.Error(tErr))
+	}
+	defer tracingShutdown(context.Background())
 
 	// --- WEEK 2 ADDITION: Interceptors ---
 	obsLog := observability.NewLogger(log)
@@ -159,7 +182,7 @@ func run() error {
 
 	// --- Checkpoint 2: Redis startup validation ---
 	if cfg.RequireRedis && cfg.ReservationRedisURL == "" {
-		log.Fatal("REQUIRE_REDIS=true but RESERVATION_REDIS_URL is not set — refusing to start in multi-replica mode")
+		return fmt.Errorf("REQUIRE_REDIS=true but RESERVATION_REDIS_URL is not set — refusing to start in multi-replica mode")
 	}
 
 	// --- WEEK 2 ADDITION: Reservation Store initialization ---
@@ -169,6 +192,9 @@ func run() error {
 	if cfg.ReservationRedisURL != "" {
 		redisRes, err := reservation.NewRedisStore(cfg.ReservationRedisURL)
 		if err != nil {
+			if cfg.RequireRedis {
+				return fmt.Errorf("reservation: failed to connect to Redis: %w", err)
+			}
 			log.Error("reservation: failed to connect to Redis, falling back to LocalStore only", zap.Error(err))
 			resStore = localRes
 		} else {
@@ -195,8 +221,7 @@ func run() error {
 		}
 		outboxStore = bs
 	} else {
-		log.Warn("outbox: OUTBOX_DB_PATH is empty, using MemoryStore (non-durable, tests ONLY)")
-		outboxStore = outbox.NewMemoryStore()
+		return fmt.Errorf("outbox: OUTBOX_DB_PATH is empty; durable storage is required for production")
 	}
 	defer outboxStore.Close()
 
@@ -217,6 +242,12 @@ func run() error {
 	registry := concurrency.NewTaskRegistry()
 	var wg sync.WaitGroup // for task draining
 
+	// --- Week 4: Load reporter ---
+	durationRing := heartbeat.NewRingBuffer(100)
+	var workerActive atomic.Int64
+	var workerProcessed atomic.Int64
+	loadRep := loadreport.NewReporter(durationRing, cfg.MaxConcurrentTasks, &workerActive, &workerProcessed)
+
 	workerSvc := service.NewWorkerServiceImpl(
 		bankClient,
 		c4Client,
@@ -229,6 +260,7 @@ func run() error {
 		registry,
 		&wg,
 		obsMetrics,
+		loadRep,
 	)
 
 
@@ -280,6 +312,18 @@ func run() error {
 			log.Error("health server error", zap.Error(err))
 		}
 	}()
+
+	// --- Week 4: /metrics/health status endpoint ---
+	statusH := health.NewStatusHandler(
+		workerID,
+		loadRep.Snapshot,
+		func() string { return "closed" }, // simplified; real version reads CB state
+		func() int {
+			entries, _ := outboxStore.Pending(context.Background())
+			return len(entries)
+		},
+	)
+	healthMux.Handle("/metrics/health", statusH)
 	// --- END CP-8 ---
 
 	grpcErrCh := make(chan error, 1)

@@ -1,9 +1,9 @@
 # PayFlow C3 Worker Service — Architecture Reference
 
-> **Version:** Week 2 (Post-Implementation)
+> **Version:** Week 4 (Final Checkpoint)
 > **Module:** `github.com/your-org/payflow/worker`
 > **Go version:** 1.25+
-> **Last updated:** 2026-04-01
+> **Last updated:** 2026-04-05
 
 ---
 
@@ -580,19 +580,19 @@ All parameters are read from environment variables by `internal/config.Load()` a
 
 ---
 
-## Known Limitations
+## Resolved Limitations (Week 3 & 4)
 
-The following are known gaps in the Week 2 implementation. Each is tracked with a severity rating and a planned remediation for Week 3.
+The following gaps from the internal milestone have now been resolved and integrated into the C3 worker:
 
-| Limitation | Severity | Planned Fix (Week 3) |
-|------------|----------|----------------------|
-| In-memory outbox (`MemoryStore`) loses all buffered results on SIGKILL or OOM; `BadgerStore` is available but requires `OUTBOX_DB_PATH` to be configured | High | Make BadgerDB the default; remove MemoryStore fallback; add startup validation |
-| `LocalStore` reservation is not safe for multi-replica deployments; Redis `TieredStore` is available but optional | High | Require `RESERVATION_REDIS_URL` in production profiles; add readiness gate that fails if Redis is unreachable |
-| No `/healthz` → `/readyz` distinction in Kubernetes probes wired to deployment manifests | Medium | Add Helm chart liveness/readiness hooks; validate probe timing against `ConnectRetryDelay` |
-| Configuration is loaded from flat environment variables without schema validation, human-readable documentation in `--help`, or config file support | Medium | Integrate `spf13/viper` file-based config with a JSON schema; add `--config` flag |
-| `worker_tasks_total` label cardinality is bounded, but `worker_bank_request_duration_ms{bank_result}` could accumulate high-cardinality values if bank result strings are not normalised | Low | Enumerate allowed `bank_result` values; apply label normalisation in `RecordBankRequestDuration` |
-| No end-to-end integration test — all tests are unit-level; the `tests/` directory is present but the harness is incomplete | Medium | Implement `bufconn`-based integration harness; add happy-path and fault-injection test scenarios |
-| Task `DeadlineUnixMs` is propagated to downstream calls but the initial semaphore `Acquire` and epoch validation are not bounded by it — a task can wait indefinitely in the queue even after its deadline has passed | Low | Apply task deadline to all phases including semaphore acquisition |
+| Limitation | Status | Remediation (Week 3 / 4) |
+|------------|--------|--------------------------|
+| In-memory outbox (`MemoryStore`) loses all buffered results on SIGKILL or OOM. | ✅ Fixed | BadgerDB is now the default; the `MemoryStore` fallback has been removed for production deployments, and the service will refuse to start without `OUTBOX_DB_PATH`. |
+| `LocalStore` reservation is not safe for multi-replica deployments. | ✅ Fixed | `REQUIRE_REDIS` is enforced on startup. If Redis is down, the worker fails fast. |
+| No `/healthz` → `/readyz` distinction in Kubernetes probes. | ✅ Fixed | Added explicit readiness checks verifying the `gRPC` layer, outbox relay, and Redis connectivity. |
+| Configuration is loaded from flat environment variables without schema validation. | ✅ Fixed | Integrated `spf13/viper` with robust schema defaulting and validation. |
+| `worker_bank_request_duration_ms{bank_result}` label cardinality unbounded. | ✅ Fixed | Label normalisation applied in observability interceptors and log field extractors. |
+| No end-to-end integration test. | ✅ Fixed | Implemented full in-memory `bufconn` harness with mocks for C2, C4, and Bank. Test coverage includes crash recovery, idempotency suppression, and throughput tests. |
+| Task `DeadlineUnixMs` is not propagated to semaphore acquisition. | ✅ Fixed | Semaphore acquisition uses a bounded `context.WithDeadline` derived directly from `Task.DeadlineUnixMs`. |
 
 ---
 

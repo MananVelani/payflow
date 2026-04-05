@@ -15,10 +15,12 @@ import (
 	"github.com/your-org/payflow/worker/internal/domain"
 	apperrors "github.com/your-org/payflow/worker/internal/errors"
 	"github.com/your-org/payflow/worker/internal/fence"
+	"github.com/your-org/payflow/worker/internal/loadreport"
 	"github.com/your-org/payflow/worker/internal/observability"
 	"github.com/your-org/payflow/worker/internal/outbox"
 	"github.com/your-org/payflow/worker/internal/resilience"
 	"github.com/your-org/payflow/worker/internal/reservation"
+	"github.com/your-org/payflow/worker/internal/tracing"
 	pb "github.com/your-org/payflow/worker/proto/worker"
 )
 
@@ -66,6 +68,9 @@ type WorkerServiceImpl struct {
 
 	// --- Checkpoint 7: Task-level retry tracker ---
 	retryTracker *RetryTracker
+
+	// --- Week 4: Load reporter ---
+	loadReporter *loadreport.Reporter
 }
 
 // NewWorkerServiceImpl constructs and returns a ready WorkerServiceImpl.
@@ -81,6 +86,7 @@ func NewWorkerServiceImpl(
 	registry *concurrency.TaskRegistry, // WEEK 2 ADDITION
 	wg *sync.WaitGroup,                 // WEEK 2 ADDITION
 	metrics *observability.Metrics,      // WEEK 2 ADDITION
+	loadReporter *loadreport.Reporter,   // WEEK 4 ADDITION
 
 ) *WorkerServiceImpl {
 
@@ -111,14 +117,27 @@ func NewWorkerServiceImpl(
 			logger.WithRaw(),
 		),
 		retryTracker: NewRetryTracker(cfg.RetryTaskMaxAttempts),
+		loadReporter: loadReporter,
 	}
 }
 
 // ExecuteTask runs the exactly-once pipeline. Called once per task received from C2.
 func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) (*domain.PaymentResult, error) {
+	taskStart := time.Now()
 	// --- WEEK 2 ADDITION: Graceful shutdown tracking ---
 	w.wg.Add(1)
 	defer w.wg.Done()
+
+	// Track task completion for load reporting
+	defer func() {
+		elapsed := time.Since(taskStart)
+		w.processed.Add(1)
+		w.totalDuration.Add(elapsed.Milliseconds())
+		if w.loadReporter != nil {
+			w.loadReporter.RecordTaskDuration(elapsed)
+		}
+	}()
+
 	// --- Checkpoint 5: Early deadline derivation ---
 	taskCtx := ctx
 	if task.DeadlineUnixMs > 0 {
@@ -169,6 +188,11 @@ func (w *WorkerServiceImpl) ExecuteTask(ctx context.Context, task *domain.Task) 
 	defer w.taskRegistry.Deregister(task.TaskID)
 	
 	ctx = revocationCtx // use revocationCtx (which is taskCtx + revocation)
+
+	// --- Week 4: Trace propagation ---
+	ctx = tracing.ExtractFromGRPCMetadata(ctx)
+	ctx, span := tracing.StartSpan(ctx, "worker.execute_task")
+	defer span.End()
 
 	// 4. Fencing token validation
 	if err := w.epochValidator.ValidateAndUpdate(ctx, task.Epoch); err != nil {
@@ -357,11 +381,18 @@ func (w *WorkerServiceImpl) RevokeTask(ctx context.Context, taskID string) error
 	w.revokedTasks.Store(taskID, true)
 	w.metrics.RecordTaskRevoked()
 
-	// 1. Mark revoked (done above)
-	// 2. Cancel active task
-	w.taskRegistry.Revoke(taskID)
+	// Cancel active task via registry
+	found := w.taskRegistry.Revoke(taskID)
 
-	// 3. Release reservation if possible
+	if found {
+		w.metrics.RecordRevokeOutcome("cancelled")
+		w.logger.Info(ctx, "task revoked — context cancelled", zap.String("task_id", taskID))
+	} else {
+		w.metrics.RecordRevokeOutcome("already_completed")
+		w.logger.Info(ctx, "revoke received for unknown task — already completed", zap.String("task_id", taskID))
+	}
+
+	// Release reservation if possible
 	if ik, ok := w.inFlightIdempotency.Load(taskID); ok {
 		w.logger.Info(ctx, "releasing reservation for revoked task", zap.String("task_id", taskID))
 		_ = w.reservationStore.Release(ctx, ik.(string))

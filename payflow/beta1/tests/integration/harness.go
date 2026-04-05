@@ -28,6 +28,8 @@ import (
 	"github.com/your-org/payflow/worker/internal/concurrency"
 	grpctransport "github.com/your-org/payflow/worker/internal/transport/grpc"
 	"github.com/your-org/payflow/worker/internal/domain"
+	"github.com/your-org/payflow/worker/internal/heartbeat"
+	"github.com/your-org/payflow/worker/internal/loadreport"
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/observability"
 	"github.com/your-org/payflow/worker/internal/outbox"
@@ -387,6 +389,12 @@ func NewHarness(t *testing.T, customCfg *config.Config) *Harness {
 	)
 	outboxInst.Start(ctx)
 
+	// --- Week 4: Load reporter ---
+	durationRing := heartbeat.NewRingBuffer(100)
+	var workerActive atomic.Int64
+	var workerProcessed atomic.Int64
+	loadRep := loadreport.NewReporter(durationRing, cfg.MaxConcurrentTasks, &workerActive, &workerProcessed)
+
 	// ── 9. Wire WorkerServiceImpl ─────────────────────────────────────────────
 	workerImpl := service.NewWorkerServiceImpl(
 		bankClient,
@@ -400,6 +408,7 @@ func NewHarness(t *testing.T, customCfg *config.Config) *Harness {
 		registry,
 		taskWg,
 		obsMetrics,
+		loadRep,
 	)
 
 	// ── 10. Start Heartbeat (for live demo) ──────────────────────────────────

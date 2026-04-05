@@ -46,22 +46,38 @@ type Metrics struct {
 	GRPCServerHandlingSeconds    *prometheus.HistogramVec
 	TaskDeadlineExceededTotal    *prometheus.CounterVec
 	TaskRetryTotal               *prometheus.CounterVec
+	// Week 4
+	HeartbeatTotal               *prometheus.CounterVec
+	HeartbeatFailuresTotal       prometheus.Counter
+	HeartbeatLatencyMs           prometheus.Histogram
+	WorkerRevokesTotal           *prometheus.CounterVec
+	WorkerCircuitBreakerState    prometheus.Gauge
+	WorkerTaskQueueDepth         prometheus.Gauge
+	WorkerBankCallDurationSec    prometheus.Histogram
 }
 
 func NewMetrics() *Metrics {
 	return &Metrics{
-		TasksTotal:                metrics.TasksTotal,
-		ActiveTasks:               metrics.ActiveTasks,
-		BankRequestDuration:       metrics.BankRequestDuration,
-		TaskDuration:              metrics.TaskDurationSeconds,
-		WorkerSaturation:          metrics.WorkerSaturation,
-		RevokedTasksTotal:         metrics.RevokedTasksTotal,
+		TasksTotal:                   metrics.TasksTotal,
+		ActiveTasks:                  metrics.ActiveTasks,
+		BankRequestDuration:          metrics.BankRequestDuration,
+		TaskDuration:                 metrics.TaskDurationSeconds,
+		WorkerSaturation:             metrics.WorkerSaturation,
+		RevokedTasksTotal:            metrics.RevokedTasksTotal,
 		RevokedResultSuppressedTotal: metrics.RevokedResultSuppressedTotal,
-		OrphanedLeaseCount:        metrics.OrphanedLeaseCount,
-		GRPCServerHandledTotal:    metrics.GRPCServerHandledTotal,
-		GRPCServerHandlingSeconds: metrics.GRPCServerHandlingSeconds,
-		TaskDeadlineExceededTotal: metrics.TaskDeadlineExceededTotal,
-		TaskRetryTotal:            metrics.TaskRetryTotal,
+		OrphanedLeaseCount:           metrics.OrphanedLeaseCount,
+		GRPCServerHandledTotal:       metrics.GRPCServerHandledTotal,
+		GRPCServerHandlingSeconds:    metrics.GRPCServerHandlingSeconds,
+		TaskDeadlineExceededTotal:    metrics.TaskDeadlineExceededTotal,
+		TaskRetryTotal:               metrics.TaskRetryTotal,
+		// Week 4
+		HeartbeatTotal:               metrics.HeartbeatTotal,
+		HeartbeatFailuresTotal:       metrics.HeartbeatFailuresTotal,
+		HeartbeatLatencyMs:           metrics.HeartbeatLatencyMs,
+		WorkerRevokesTotal:           metrics.WorkerRevokesTotal,
+		WorkerCircuitBreakerState:    metrics.WorkerCircuitBreakerState,
+		WorkerTaskQueueDepth:         metrics.WorkerTaskQueueDepth,
+		WorkerBankCallDurationSec:    metrics.WorkerBankCallDurationSeconds,
 	}
 }
 
@@ -115,4 +131,40 @@ func (m *Metrics) RecordDeadlineExceeded(stage string) {
 // RecordTaskRetry increments the retry counter with the given attempt label.
 func (m *Metrics) RecordTaskRetry(attempt string) {
 	m.TaskRetryTotal.WithLabelValues(attempt).Inc()
+}
+
+// RecordRevokeOutcome increments the revoke counter with outcome label.
+// Valid outcomes: "cancelled", "already_completed", "not_found".
+func (m *Metrics) RecordRevokeOutcome(outcome string) {
+	m.WorkerRevokesTotal.WithLabelValues(outcome).Inc()
+}
+
+// RecordHeartbeatSend increments the heartbeat counter with status label.
+func (m *Metrics) RecordHeartbeatSend(status string) {
+	m.HeartbeatTotal.WithLabelValues(status).Inc()
+}
+
+// RecordHeartbeatFailure increments the heartbeat failure counter.
+func (m *Metrics) RecordHeartbeatFailure() {
+	m.HeartbeatFailuresTotal.Inc()
+}
+
+// RecordHeartbeatLatency observes heartbeat round-trip time.
+func (m *Metrics) RecordHeartbeatLatency(ms float64) {
+	m.HeartbeatLatencyMs.Observe(ms)
+}
+
+// SetCircuitBreakerState sets the circuit breaker state gauge.
+func (m *Metrics) SetCircuitBreakerState(state float64) {
+	m.WorkerCircuitBreakerState.Set(state)
+}
+
+// SetTaskQueueDepth sets the gauge of tasks waiting for a slot.
+func (m *Metrics) SetTaskQueueDepth(depth float64) {
+	m.WorkerTaskQueueDepth.Set(depth)
+}
+
+// RecordBankCallDuration observes bank call duration in seconds.
+func (m *Metrics) RecordBankCallDuration(seconds float64) {
+	m.WorkerBankCallDurationSec.Observe(seconds)
 }

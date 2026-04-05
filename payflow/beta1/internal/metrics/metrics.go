@@ -66,6 +66,47 @@ var (
 		},
 		[]string{"grpc_service", "grpc_method"},
 	)
+
+	// ── Week 4 Metrics ──────────────────────────────────────────────────────
+
+	// HeartbeatTotal counts heartbeat sends by status (ok|error).
+	HeartbeatTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "worker_heartbeat_total", Help: "Heartbeat pings sent by status."},
+		[]string{"status"},
+	)
+	// HeartbeatFailuresTotal counts consecutive heartbeat failures.
+	HeartbeatFailuresTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{Name: "worker_heartbeat_failures_total", Help: "Total heartbeat send failures."},
+	)
+	// HeartbeatLatencyMs tracks heartbeat round-trip latency.
+	HeartbeatLatencyMs = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "worker_heartbeat_latency_ms",
+			Help:    "Heartbeat gRPC call latency in milliseconds.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000},
+		},
+	)
+	// WorkerRevokesTotal counts hard revocations by outcome.
+	WorkerRevokesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "worker_revokes_total", Help: "Hard revocations by outcome."},
+		[]string{"outcome"},
+	)
+	// WorkerCircuitBreakerState tracks the circuit breaker state (0=closed, 1=half-open, 2=open).
+	WorkerCircuitBreakerState = prometheus.NewGauge(
+		prometheus.GaugeOpts{Name: "worker_circuit_breaker_state", Help: "CB state: 0=closed, 1=half-open, 2=open."},
+	)
+	// WorkerTaskQueueDepth is a gauge of tasks waiting for a semaphore slot.
+	WorkerTaskQueueDepth = prometheus.NewGauge(
+		prometheus.GaugeOpts{Name: "worker_task_queue_depth", Help: "Tasks waiting for a semaphore slot."},
+	)
+	// WorkerBankCallDurationSeconds is a histogram of bank API call latency.
+	WorkerBankCallDurationSeconds = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "worker_bank_call_duration_seconds",
+			Help:    "Bank API call latency in seconds.",
+			Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0},
+		},
+	)
 )
 
 func Register() {
@@ -84,6 +125,14 @@ func Register() {
 		GRPCServerHandlingSeconds,
 		TaskDeadlineExceededTotal,
 		TaskRetryTotal,
+		// Week 4
+		HeartbeatTotal,
+		HeartbeatFailuresTotal,
+		HeartbeatLatencyMs,
+		WorkerRevokesTotal,
+		WorkerCircuitBreakerState,
+		WorkerTaskQueueDepth,
+		WorkerBankCallDurationSeconds,
 	)
 }
 
