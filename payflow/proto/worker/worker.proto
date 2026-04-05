@@ -53,6 +53,7 @@ message TaskResult {
     int64 epoch = 1;
     string task_id = 2;
     string worker_id = 3;
+    string idempotency_key = 6;
     
     oneof status {
         bool success = 4;
