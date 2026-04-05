@@ -1,0 +1,27 @@
+services:
+  worker:
+    build: .
+    environment:
+      - COORDINATOR_ADDR=coordinator:50051
+      - LOG_SERVICE_ADDR=log-service:50052
+      - BANK_API_ADDR=http://mock-bank:8080
+      - WORKER_ID=worker-1
+      - GRPC_PORT=50053
+      - METRICS_PORT=9092
+      - MAX_CONCURRENT_TASKS=10
+      - HEARTBEAT_INTERVAL=5s
+      - BANK_FAIL_RATE=0.1
+      - BANK_LATENCY_MIN_MS=50
+      - BANK_LATENCY_MAX_MS=500
+      - RETRY_MAX_ATTEMPTS=3
+      - RETRY_BASE_DELAY_MS=1000
+      - LOG_LEVEL=debug
+    ports:
+      - "50053:50053"
+      - "9092:9092"
+    healthcheck:
+      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9092/metrics" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
