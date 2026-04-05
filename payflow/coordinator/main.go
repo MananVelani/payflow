@@ -75,28 +75,34 @@ func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMes
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Received ELECTION from %s (Req Epoch: %d)", c.ID, c.State, c.Epoch, req.CandidateId, req.Epoch)
+
 	// CRITICAL FIX 1: Ignore stale election requests from older epochs
 	if req.Epoch < c.Epoch {
-		log.Printf("[Node %s] Rejecting stale ELECTION from %s (Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, c.Epoch)
+		log.Printf("[DEBUG-TRACE] Node %s | REJECTED %s (Stale Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, c.Epoch)
 		return &coordPb.ElectionResponse{
 			Epoch: c.Epoch,
 			Ok:    false, // Do not agree to the election!
 		}, nil
 	}
-
-	if req.Epoch > c.Epoch {
-		log.Printf("[Node %s] Received higher epoch ELECTION from %s (Epoch %d > %d). Stepping down to FOLLOWER", c.ID, req.CandidateId, req.Epoch, c.Epoch)
-		c.Epoch = req.Epoch
-		c.State = "FOLLOWER"
-	}
 	
-	log.Printf("[Node %s] Received ELECTION from %s with epoch %d", c.ID, req.CandidateId, req.Epoch)
-
 	// CRITICAL FIX 2: Mathematical ID comparison instead of string comparison
 	myID := parseNodeID(c.ID)
 	candidateID := parseNodeID(req.CandidateId)
+	
+	if req.Epoch > c.Epoch {
+		log.Printf("[DEBUG-TRACE] Node %s | ADOPTING HIGHER EPOCH: %d -> %d", c.ID, c.Epoch, req.Epoch)
+		c.Epoch = req.Epoch
+		if candidateID > myID {
+			log.Printf("[DEBUG-TRACE] Node %s | Challenger %s is stronger. Stepping down to FOLLOWER.", c.ID, req.CandidateId)
+			c.State = "FOLLOWER"
+		} else {
+			log.Printf("[DEBUG-TRACE] Node %s | Challenger %s is WEAKER. Remaining %s.", c.ID, req.CandidateId, c.State)
+		}
+	}
 
 	if candidateID < myID {
+		log.Printf("[DEBUG-TRACE] Node %s | FIGHTING BACK against weaker node %s. Triggering my own election.", c.ID, req.CandidateId)
 		go c.triggerElection() // Step down and start our own election to crush them
 	}
 
@@ -118,8 +124,12 @@ func (c *CoordinatorNode) AnnounceCoordinator(ctx context.Context, req *coordPb.
 		}, nil
 	}
 
-	if c.State != "FOLLOWER" || req.Epoch > c.Epoch {
+	if req.Epoch > c.Epoch {
+		c.Epoch = req.Epoch
 		log.Printf(("[Node %s] Acknowledging Leader %s for Epoch %d"), c.ID, req.LeaderId, req.Epoch)
+		if c.State == "LEADER" {
+			c.State = "FOLLOWER"
+		}
 	}
 
 	myId := parseNodeID(c.ID)
@@ -137,11 +147,6 @@ func (c *CoordinatorNode) AnnounceCoordinator(ctx context.Context, req *coordPb.
 
 	// Step down and accept the new leader
 	c.State = "FOLLOWER"
-
-	// Sync our epoch with the leader's epoch
-	if req.Epoch > c.Epoch {
-		c.Epoch = req.Epoch
-	}
 
 	// Reset the timeout timer so we don't accidentally trigger another election
 	// (The non-blocking channel send we built earlier!)
@@ -217,8 +222,8 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 		TaskId:         txnID,
 		IdempotencyKey: req.IdempotencyKey,
 		Amount:         req.Amount,
-		// Currency:       req.Currency,   // Point 6 fix
-		// MerchantId:     req.MerchantId, // Point 6 fix
+		Currency:       req.Currency,   // Point 6 fix
+		MerchantId:     req.MerchantId, // Point 6 fix
 	}
 
 	// POINT 3 FIX: Use a select statement with a strict timeout instead of an unbounded goroutine.
@@ -236,7 +241,7 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 		// The queue filled up during the split-second we were writing to the database.
 		// We drop the memory operation to prevent a goroutine leak. 
 		// The task is safe in the C4 WAL and will be recovered on the next leader election.
-		log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
+		log.Printf("[LEADER %s] CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
 		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, task %s recorded but delayed", txnID)
 	}
 }
@@ -320,11 +325,13 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskResult) (*workerPb.ResultAck, error) {
 	c.mu.Lock()
 	isLeader := c.State == "LEADER"
-	c.mu.Unlock()
-
 	if !isLeader {
+		c.mu.Unlock()
 		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader", c.ID)
 	}
+
+	delete(c.InFlight, req.WorkerId) // Remove from in-flight tracking immediately to prevent double-processing
+	c.mu.Unlock()
 
 	log.Printf("[LEADER %s] Processing task result for %s from worker %s", c.ID, req.TaskId, req.WorkerId)
 
@@ -342,7 +349,7 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
 			TxnId:   req.TaskId,
 			Success: isSuccess,
-			// IdempotencyKey: req.GetIdempotencyKey(), // FIX: Uncomment this once you've added the field to worker.proto
+			IdempotencyKey: req.GetIdempotencyKey(),
 		})
 
 		if err != nil {
@@ -397,7 +404,7 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 				case c.TaskQueue <- task:
 					log.Printf("[LEADER %s] Successfully re-enqueued task %s", c.ID, task.TaskId)
 				default:
-					log.Printf("[LEADER %s] ⚠️ CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
+					log.Printf("[LEADER %s] CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
 				}
 				return err
 			}
@@ -408,30 +415,57 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 	}
 }
 
-// StartLeaderMonitor runs continuously in the background.
+// // StartLeaderMonitor runs continuously in the background.
+// func (c *CoordinatorNode) StartLeaderMonitor() {
+// 	// The 'go' keyword spins this off into its own concurrent thread
+// 	go func() {
+// 		timer := time.NewTimer(c.leaderTimeout)
+// 		for {
+// 			select {
+// 			case <-timer.C:
+// 				// The timer hit 0. The leader is presumed DEAD.
+// 				c.triggerElection()
+
+// 				// Reset the timer so we don't spam elections endlessly
+// 				timer.Reset(c.leaderTimeout)
+
+// 			case <-c.resetTimer:
+// 				// We got a ping from the leader! Reset the countdown.
+// 				if !timer.Stop() {
+// 					// Drain the channel to prevent memory leaks if it already fired
+// 					select {
+// 					case <-timer.C:
+// 					default:
+// 					}
+// 				}
+// 				timer.Reset(c.leaderTimeout)
+// 			}
+// 		}
+// 	}()
+// }
+
+// StartLeaderMonitor checks if the leader has sent a heartbeat recently
 func (c *CoordinatorNode) StartLeaderMonitor() {
-	// The 'go' keyword spins this off into its own concurrent thread
 	go func() {
-		timer := time.NewTimer(c.leaderTimeout)
 		for {
+			c.mu.Lock()
+			currentState := c.State
+			currentEpoch := c.Epoch
+			c.mu.Unlock()
+
+			// Only FOLLOWERs should be monitoring for leader timeouts
+			if currentState == "LEADER" {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
 			select {
-			case <-timer.C:
-				// The timer hit 0. The leader is presumed DEAD.
+			case <-time.After(c.leaderTimeout):
+				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | TIMER FIRED! No heartbeat received.", c.ID, currentState, currentEpoch)
 				c.triggerElection()
-
-				// Reset the timer so we don't spam elections endlessly
-				timer.Reset(c.leaderTimeout)
-
 			case <-c.resetTimer:
-				// We got a ping from the leader! Reset the countdown.
-				if !timer.Stop() {
-					// Drain the channel to prevent memory leaks if it already fired
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(c.leaderTimeout)
+				// Timer was successfully reset by a heartbeat
+				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Timer reset successfully.", c.ID, currentState, currentEpoch)
 			}
 		}
 	}()
@@ -440,19 +474,23 @@ func (c *CoordinatorNode) StartLeaderMonitor() {
 // triggerElection safely updates the state and prepares to fight for leadership
 func (c *CoordinatorNode) triggerElection() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	
 	// If we are already the leader, we don't need to overthrow ourselves
-	if c.State == "LEADER" {
+	if c.State == "LEADER" || c.State == "CANDIDATE" {
+		log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Election trigger ignored", c.ID, c.State, c.Epoch)
+		c.mu.Unlock()
 		return
 	}
-
+	
+	oldState := c.State
 	// Transition to CANDIDATE and increment our Epoch
 	c.State = "CANDIDATE"
 	c.Epoch++
 
-	log.Printf("[Node %s] Leader timeout! Transitioned to CANDIDATE for Epoch %d", c.ID, c.Epoch)
+	currentEpoch := c.Epoch // Capture the epoch for logging before we release the lock
+	c.mu.Unlock()
 
+	log.Printf("[DEBUG-TRACE] Node %s | STATE MUTATION: %s -> CANDIDATE | Epoch escalated to %d", c.ID, oldState, currentEpoch)
 	go c.broadcastElection()
 }
 
@@ -519,12 +557,16 @@ func (c *CoordinatorNode) broadcastElection() {
 
 	// 6. Evaluate the Election Results
 	if !gotOk {
-		log.Printf("[Node %s] No higher nodes responded OK. I am the new LEADER!", c.ID)
-		c.becomeLeader()
+		log.Printf("[Node %s] No higher nodes responded OK. Claiming leadership...", c.ID)
+		// Use the new safeguard instead of blindly calling c.becomeLeader()
+		c.checkAndBecomeLeader(currentEpoch)
 	} else {
 		log.Printf("[Node %s] A higher node is alive. Stepping down to FOLLOWER.", c.ID)
 		c.mu.Lock()
-		c.State = "FOLLOWER"
+		// Only step down if we haven't already moved on to a higher epoch
+		if c.Epoch == currentEpoch {
+			c.State = "FOLLOWER"
+		}
 		c.mu.Unlock()
 	}
 }
@@ -601,7 +643,7 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 // rebuildQueueFromC4 queries the persistent log for stranded tasks and re-enqueues them.
 func (c *CoordinatorNode) rebuildQueueFromC4() {
 	if c.c4Client == nil {
-		log.Printf("[LEADER %s] ⚠️ Cannot rebuild queue: C4 persistent client is nil", c.ID)
+		log.Printf("[LEADER %s] Cannot rebuild queue: C4 persistent client is nil", c.ID)
 		return
 	}
 
@@ -630,7 +672,7 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 			break
 		}
 		if err != nil {
-			log.Printf("[LEADER %s] ⚠️ Error reading from C4 recovery stream: %v", c.ID, err)
+			log.Printf("[LEADER %s] Error reading from C4 recovery stream: %v", c.ID, err)
 			break
 		}
 
@@ -643,8 +685,8 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 
 		// 4. Safely type-assert the fields extracted from the JSON map
 		amount, _ := payload["amount"].(float64)
-		// currency, _ := payload["currency"].(string)
-		// merchantID, _ := payload["merchant_id"].(string)
+		currency, _ := payload["currency"].(string)
+		merchantID, _ := payload["merchant_id"].(string)
 		idempotencyKey, _ := payload["idempotency_key"].(string)
 
 		// 5. Reconstruct the TaskAssignment
@@ -652,22 +694,35 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 			Epoch:  c.Epoch, // Stamp it with the NEW leader's epoch
 			TaskId: entry.TxnId,
 			Amount: amount,
-			// Currency:       currency,
-			// MerchantId:     merchantID,
+			Currency:       currency,
+			MerchantId:     merchantID,
 			IdempotencyKey: idempotencyKey,
 		}
 
-		// 6. Non-blocking enqueue
-		select {
-		case c.TaskQueue <- recoveredTask:
-			recoveredCount++
-			log.Printf("[LEADER %s] Successfully re-enqueued stranded task %s", c.ID, recoveredTask.TaskId)
-		default:
-			log.Printf("[LEADER %s] ⚠️ Queue full during startup recovery! Dropped task %s", c.ID, recoveredTask.TaskId)
-		}
+		// 6. BLOCKING enqueue guarantees ZERO data loss.
+		// If the channel is full (100 items), this will pause until a worker connects and processes a task.
+		c.TaskQueue <- recoveredTask
+		recoveredCount++
+		log.Printf("[LEADER %s] Successfully re-enqueued stranded task %s", c.ID, recoveredTask.TaskId) // avoid task drop as planned
 	}
 
 	log.Printf("[LEADER %s] Recovery complete. Restored %d pending tasks from C4 WAL", c.ID, recoveredCount)
+}
+
+// checkAndBecomeLeader prevents stale goroutines from hijacking the cluster
+func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
+	c.mu.Lock()
+	// CRITICAL FIX: If our epoch changed or we were forced to step down 
+	// while waiting for the network, ABORT the takeover!
+	if c.State != "CANDIDATE" {
+		log.Printf("[Node %s] Election aborted. Current state: %s", c.ID, c.State)
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	
+	// We are still the valid candidate. Claim the throne!
+	c.becomeLeader()
 }
 
 // becomeLeader locks in the victory and changes the state
@@ -679,12 +734,11 @@ func (c *CoordinatorNode) becomeLeader() {
 	c.broadcastCoordinator()
 
 	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, c.Epoch)
-	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
-
-	c.rebuildQueueFromC4() // Recovery Function
-
 	go c.startLeaderHeartbeat()
 	go c.startWorkerMonitor()
+	
+	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
+	go c.rebuildQueueFromC4() // Recovery Function
 }
 
 func main() {

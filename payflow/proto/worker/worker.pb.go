@@ -295,6 +295,8 @@ type TaskAssignment struct {
 	TaskId         string                 `protobuf:"bytes,2,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
 	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	Amount         float64                `protobuf:"fixed64,4,opt,name=amount,proto3" json:"amount,omitempty"`
+	Currency       string                 `protobuf:"bytes,5,opt,name=currency,proto3" json:"currency,omitempty"`
+	MerchantId     string                 `protobuf:"bytes,6,opt,name=merchant_id,json=merchantId,proto3" json:"merchant_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -357,11 +359,26 @@ func (x *TaskAssignment) GetAmount() float64 {
 	return 0
 }
 
+func (x *TaskAssignment) GetCurrency() string {
+	if x != nil {
+		return x.Currency
+	}
+	return ""
+}
+
+func (x *TaskAssignment) GetMerchantId() string {
+	if x != nil {
+		return x.MerchantId
+	}
+	return ""
+}
+
 type TaskResult struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Epoch    int64                  `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	TaskId   string                 `protobuf:"bytes,2,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	WorkerId string                 `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Epoch          int64                  `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	TaskId         string                 `protobuf:"bytes,2,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	WorkerId       string                 `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,6,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// Types that are valid to be assigned to Status:
 	//
 	//	*TaskResult_Success
@@ -418,6 +435,13 @@ func (x *TaskResult) GetTaskId() string {
 func (x *TaskResult) GetWorkerId() string {
 	if x != nil {
 		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *TaskResult) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
 	}
 	return ""
 }
@@ -527,17 +551,21 @@ const file_proto_worker_proto_rawDesc = "" +
 	"\x11HeartbeatResponse\x12\"\n" +
 	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"*\n" +
 	"\vPollRequest\x12\x1b\n" +
-	"\tworker_id\x18\x02 \x01(\tR\bworkerId\"\x80\x01\n" +
+	"\tworker_id\x18\x02 \x01(\tR\bworkerId\"\xbd\x01\n" +
 	"\x0eTaskAssignment\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x03R\x05epoch\x12\x17\n" +
 	"\atask_id\x18\x02 \x01(\tR\x06taskId\x12'\n" +
 	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x12\x16\n" +
-	"\x06amount\x18\x04 \x01(\x01R\x06amount\"\xa5\x01\n" +
+	"\x06amount\x18\x04 \x01(\x01R\x06amount\x12\x1a\n" +
+	"\bcurrency\x18\x05 \x01(\tR\bcurrency\x12\x1f\n" +
+	"\vmerchant_id\x18\x06 \x01(\tR\n" +
+	"merchantId\"\xce\x01\n" +
 	"\n" +
 	"TaskResult\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x03R\x05epoch\x12\x17\n" +
 	"\atask_id\x18\x02 \x01(\tR\x06taskId\x12\x1b\n" +
-	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12\x1a\n" +
+	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12'\n" +
+	"\x0fidempotency_key\x18\x06 \x01(\tR\x0eidempotencyKey\x12\x1a\n" +
 	"\asuccess\x18\x04 \x01(\bH\x00R\asuccess\x12%\n" +
 	"\rerror_message\x18\x05 \x01(\tH\x00R\ferrorMessageB\b\n" +
 	"\x06status\"/\n" +
