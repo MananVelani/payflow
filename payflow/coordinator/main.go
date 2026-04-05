@@ -717,7 +717,7 @@ func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
 	// CRITICAL FIX: If our epoch changed or we were forced to step down 
 	// while waiting for the network, ABORT the takeover!
 	if c.State != "CANDIDATE" {
-		log.Printf("[Node %s] Election aborted. Current state: %s", c.ID, c.State)
+		log.Printf("[Node %s] Election aborted. Current state: %s. Current Epoch: %d. Election Epoch: %d", c.ID, c.State, c.Epoch, electionEpoch)
 		c.mu.Unlock()
 		return
 	}
