@@ -4,122 +4,70 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"net"
+
+	"google.golang.org/grpc"
+
+	pb "payflow/proto/log"
 )
 
+type LogServer struct {
+	pb.UnimplementedPaymentLogServiceServer
+	store *Store
+}
+
+func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.AppendResponse, error) {
+
+	log.Println("Saving txn:", req.TxnId)
+
+	// Save to DB
+	s.store.Save(req.TxnId, req)
+
+	return &pb.AppendResponse{
+		LogIndex: 1,
+		Success:  true,
+	}, nil
+}
+
+func (s *LogServer) CheckIdempotency(ctx context.Context, req *pb.IdempotencyRequest) (*pb.IdempotencyResponse, error) {
+
+	exists, txnID, success := s.store.CheckIdempotency(req.IdempotencyKey)
+
+	return &pb.IdempotencyResponse{
+		Exists:  exists,
+		TxnId:   txnID,
+		Success: success,
+	}, nil
+}
+
+func (s *LogServer) WriteResult(ctx context.Context, req *pb.WriteResultRequest) (*pb.WriteResultAck, error) {
+
+	s.store.WriteResult(req.IdempotencyKey, req.TxnId, req.Success)
+
+	return &pb.WriteResultAck{
+		Acknowledged: true,
+	}, nil
+}
+
 func main() {
-	port := getEnv("PORT", "8080")
-	metricsPort := getEnv("METRICS_PORT", "2112")
+	// ✅ FIX: move here
+	store := NewStore()
 
-	// Server A: main service endpoints
-	mainMux := http.NewServeMux()
-	mainMux.HandleFunc("/health", handleHealth)
-	mainMux.HandleFunc("/metrics", handleMetricsStub)
-	mainMux.HandleFunc("/v1/payments", handlePaymentStub)
-
-	mainServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mainMux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+	lis, err := net.Listen("tcp", ":50054")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
 	}
 
-	// Server B: dedicated Prometheus metrics endpoint
-	metricsMux := http.NewServeMux()
-	metricsMux.HandleFunc("/metrics", handlePrometheusMetrics)
-	metricsMux.HandleFunc("/health", handleHealth)
+	grpcServer := grpc.NewServer()
 
-	metricsServer := &http.Server{
-		Addr:         ":" + metricsPort,
-		Handler:      metricsMux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+	pb.RegisterPaymentLogServiceServer(grpcServer, &LogServer{
+		store: store,
+	})
+
+	log.Println("C4 Payment Log running on :50054")
+
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
 	}
-
-	// Start both servers concurrently
-	go func() {
-		log.Printf("placeholder service listening on :%s", port)
-		if err := mainServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("main server error: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Printf("placeholder metrics server listening on :%s", metricsPort)
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("metrics server error: %v", err)
-		}
-	}()
-
-	// Graceful shutdown on SIGTERM/SIGINT
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-quit
-	log.Printf("received signal %s, shutting down gracefully...", sig)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := mainServer.Shutdown(ctx); err != nil {
-		log.Printf("main server shutdown error: %v", err)
-	}
-	if err := metricsServer.Shutdown(ctx); err != nil {
-		log.Printf("metrics server shutdown error: %v", err)
-	}
-
-	log.Println("placeholder service stopped")
-}
-
-// handleHealth returns a JSON health check response.
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	resp := map[string]string{
-		"status":  "ok",
-		"service": "placeholder",
-	}
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handleMetricsStub returns a minimal metrics stub for the main port.
-func handleMetricsStub(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "# placeholder metrics\n")
-}
-
-// handlePaymentStub returns a stub payment response.
-func handlePaymentStub(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	resp := map[string]string{
-		"txn_id": "stub-001",
-		"status": "queued",
-	}
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handlePrometheusMetrics returns valid Prometheus text format metrics.
-func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `# HELP placeholder_up Service is up
-# TYPE placeholder_up gauge
-placeholder_up 1
-`)
-}
-
-// getEnv reads an environment variable with a fallback default value.
-func getEnv(key, fallback string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	return fallback
 }
