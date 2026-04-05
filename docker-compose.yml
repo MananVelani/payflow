@@ -1,0 +1,332 @@
+# PayFlow — Distributed Payment Processing System
+# Docker Compose Orchestration for all services
+# Owner: Member 5 (Monitoring, Testing & Infrastructure)
+#
+# Usage:
+#   docker compose up --build        — start all services
+#   docker compose down --volumes    — stop and clean up
+#   docker compose logs <service>    — view service logs
+
+x-coordinator-base: &coordinator-base
+  build:
+    context: ./payflow/coordinator
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: "256M"
+  restart: unless-stopped
+  networks:
+    - payflow-net
+  depends_on:
+    payment-log:
+      condition: service_healthy
+  healthcheck:
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+x-worker-base: &worker-base
+  build:
+    context: ./payflow/worker
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: "128M"
+  restart: unless-stopped
+  networks:
+    - payflow-net
+  depends_on:
+    coordinator-1:
+      condition: service_healthy
+    coordinator-2:
+      condition: service_healthy
+    coordinator-3:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:2112/metrics"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+
+x-worker-env: &worker-env
+  METRICS_PORT: "2112"
+  COORDINATOR_ADDRS: "coordinator-1:50051,coordinator-2:50052,coordinator-3:50053"
+  HEARTBEAT_INTERVAL: "2s"
+  BANK_API_URL: "http://mock-bank:9999"
+  BANK_API_LATENCY_MIN_MS: "50"
+  BANK_API_LATENCY_MAX_MS: "500"
+  BANK_FAILURE_RATE: "0.10"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+
+services:
+  # ─────────────────────────────────────────────────────────
+  # C1: API Gateway — REST + gRPC entry point
+  # ─────────────────────────────────────────────────────────
+  api-gateway:
+    build:
+      context: ./payflow/gateway
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      PORT: "8080"
+      METRICS_PORT: "2112"
+      GRPC_PORT: "9090"
+      JWT_SECRET: "dev-secret-change-in-prod"
+      COORDINATOR_ADDRS: "coordinator-1:50051,coordinator-2:50052,coordinator-3:50053"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "api-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+  # ─────────────────────────────────────────────────────────
+  # C2: Coordinator Cluster — Bully Election + Task Dispatch
+  # ─────────────────────────────────────────────────────────
+  coordinator-1:
+    <<: *coordinator-base
+    ports:
+      - "50051:50051"
+      - "2112:2112"
+    environment:
+      NODE_ID: "1"
+      PORT: "50051"
+      GRPC_PORT: "50051"
+      METRICS_PORT: "2112"
+      PEERS: "coordinator-2:50052,coordinator-3:50053"
+      PAYMENT_LOG_ADDR: "payment-log:50054"
+      HEARTBEAT_INTERVAL: "2s"
+      ELECTION_TIMEOUT: "5s"
+      ELECTION_TIMEOUT_MS: "5000"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      HEARTBEAT_MISS_THRESHOLD: "3"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "coordinator-1"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+
+  coordinator-2:
+    <<: *coordinator-base
+    ports:
+      - "50052:50052"
+      - "2153:2112"
+    environment:
+      NODE_ID: "2"
+      PORT: "50052"
+      GRPC_PORT: "50052"
+      METRICS_PORT: "2112"
+      PEERS: "coordinator-1:50051,coordinator-3:50053"
+      PAYMENT_LOG_ADDR: "payment-log:50054"
+      HEARTBEAT_INTERVAL: "2s"
+      ELECTION_TIMEOUT: "5s"
+      ELECTION_TIMEOUT_MS: "5000"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      HEARTBEAT_MISS_THRESHOLD: "3"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "coordinator-2"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50052 || exit 1"]
+
+  coordinator-3:
+    <<: *coordinator-base
+    ports:
+      - "50053:50053"
+      - "2154:2112"
+    environment:
+      NODE_ID: "3"
+      PORT: "50053"
+      GRPC_PORT: "50053"
+      METRICS_PORT: "2112"
+      PEERS: "coordinator-1:50051,coordinator-2:50052"
+      PAYMENT_LOG_ADDR: "payment-log:50054"
+      HEARTBEAT_INTERVAL: "2s"
+      ELECTION_TIMEOUT: "5s"
+      ELECTION_TIMEOUT_MS: "5000"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      HEARTBEAT_MISS_THRESHOLD: "3"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "coordinator-3"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50053 || exit 1"]
+
+  # ─────────────────────────────────────────────────────────
+  # C3: Worker Services — Payment Execution + Heartbeat
+  # ─────────────────────────────────────────────────────────
+  worker-1:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      WORKER_ID: "1"
+      PORT: "2112"
+      OTEL_SERVICE_NAME: "worker-1"
+
+  worker-2:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      WORKER_ID: "2"
+      PORT: "2112"
+      OTEL_SERVICE_NAME: "worker-2"
+
+  worker-3:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      WORKER_ID: "3"
+      PORT: "2112"
+      OTEL_SERVICE_NAME: "worker-3"
+
+  worker-4:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      WORKER_ID: "4"
+      PORT: "2112"
+      OTEL_SERVICE_NAME: "worker-4"
+
+  worker-5:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      WORKER_ID: "5"
+      PORT: "2112"
+      OTEL_SERVICE_NAME: "worker-5"
+
+  # ─────────────────────────────────────────────────────────
+  # C4: Payment Log Service — BoltDB append-only log
+  # ─────────────────────────────────────────────────────────
+  payment-log:
+    build:
+      context: ./payflow/payment-log
+    ports:
+      - "50054:50054"
+      - "2113:2113"
+    environment:
+      PORT: "2113"
+      GRPC_PORT: "50054"
+      METRICS_PORT: "2112"
+      HEALTH_PORT: "2113"
+      BOLT_PATH: "/data/payments.db"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "payment-log"
+    volumes:
+      - payflow-bolt:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:2113/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "512M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+  # ─────────────────────────────────────────────────────────
+  # C5: Monitoring Service — Prometheus + WebSocket Dashboard
+  # ─────────────────────────────────────────────────────────
+  monitor:
+    build:
+      context: ./payflow/monitor
+    ports:
+      - "3000:3000"
+      - "9091:9091"
+    environment:
+      HTTP_PORT: "3000"
+      PROMETHEUS_PORT: "9091"
+      SCRAPE_INTERVAL: "15s"
+      SCRAPE_TARGETS: >-
+        http://api-gateway:8080/metrics,
+        http://coordinator-1:2112/metrics,
+        http://coordinator-2:2112/metrics,
+        http://coordinator-3:2112/metrics,
+        http://payment-log:2112/metrics,
+        http://worker-1:2112/metrics,
+        http://worker-2:2112/metrics,
+        http://worker-3:2112/metrics,
+        http://worker-4:2112/metrics,
+        http://worker-5:2112/metrics
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "monitor"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+  # ─────────────────────────────────────────────────────────
+  # Supporting: Jaeger Distributed Tracing
+  # ─────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:16686/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+volumes:
+  payflow-bolt:
+    driver: local
+    labels:
+      com.payflow.description: "BoltDB persistent store for C4 payment-log"
+
+networks:
+  payflow-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

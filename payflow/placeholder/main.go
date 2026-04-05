@@ -12,11 +12,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	// Update this module path to match your go.mod
-	paymentPb "payflow/proto/payment" 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -36,7 +31,10 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	grpcClient := paymentPb.NewPaymentGatewayClient(conn)
+	// Server B: dedicated Prometheus metrics endpoint
+	metricsMux := http.NewServeMux()
+	metricsMux.HandleFunc("/metrics", handlePrometheusMetrics)
+	metricsMux.HandleFunc("/health", handleHealth)
 
 	metricsServer := &http.Server{
 		Addr:         ":" + metricsPort,
@@ -53,21 +51,10 @@ func main() {
 		}
 	}()
 
-		// 3. Forward request to Coordinator via gRPC [cite: 59]
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		resp, err := grpcClient.SubmitTask(ctx, &paymentPb.SubmitTaskRequest{
-			Epoch:          1, // Dummy epoch for Week 1
-			Amount:         req.Amount,
-			Currency:       req.Currency,
-			MerchantId:     req.MerchantID,
-			IdempotencyKey: req.IdempotencyKey,
-		})
-
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
-			return
+	go func() {
+		log.Printf("placeholder metrics server listening on :%s", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("metrics server error: %v", err)
 		}
 	}()
 

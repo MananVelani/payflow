@@ -1,3 +1,5 @@
+// Package main implements a canonical placeholder HTTP server for PayFlow services.
+// Members 1–4 copy this into their service directories and replace with real code in Weeks 2–3.
 package main
 
 import (
