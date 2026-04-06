@@ -21,7 +21,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PaymentGateway_SubmitTask_FullMethodName = "/payflow.payment.v1.PaymentGateway/SubmitTask"
+	PaymentGateway_SubmitTask_FullMethodName       = "/payflow.payment.v1.PaymentGateway/SubmitTask"
+	PaymentGateway_SubmitBatch_FullMethodName      = "/payflow.payment.v1.PaymentGateway/SubmitBatch"
+	PaymentGateway_GetPaymentStatus_FullMethodName = "/payflow.payment.v1.PaymentGateway/GetPaymentStatus"
 )
 
 // PaymentGatewayClient is the client API for PaymentGateway service.
@@ -32,6 +34,8 @@ const (
 type PaymentGatewayClient interface {
 	// Accepts amount, currency, merchant_id, idempotency_key
 	SubmitTask(ctx context.Context, in *SubmitTaskRequest, opts ...grpc.CallOption) (*SubmitTaskResponse, error)
+	SubmitBatch(ctx context.Context, in *SubmitBatchRequest, opts ...grpc.CallOption) (*SubmitBatchResponse, error)
+	GetPaymentStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*GetStatusResponse, error)
 }
 
 type paymentGatewayClient struct {
@@ -52,6 +56,26 @@ func (c *paymentGatewayClient) SubmitTask(ctx context.Context, in *SubmitTaskReq
 	return out, nil
 }
 
+func (c *paymentGatewayClient) SubmitBatch(ctx context.Context, in *SubmitBatchRequest, opts ...grpc.CallOption) (*SubmitBatchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubmitBatchResponse)
+	err := c.cc.Invoke(ctx, PaymentGateway_SubmitBatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *paymentGatewayClient) GetPaymentStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*GetStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetStatusResponse)
+	err := c.cc.Invoke(ctx, PaymentGateway_GetPaymentStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PaymentGatewayServer is the server API for PaymentGateway service.
 // All implementations must embed UnimplementedPaymentGatewayServer
 // for forward compatibility.
@@ -60,6 +84,8 @@ func (c *paymentGatewayClient) SubmitTask(ctx context.Context, in *SubmitTaskReq
 type PaymentGatewayServer interface {
 	// Accepts amount, currency, merchant_id, idempotency_key
 	SubmitTask(context.Context, *SubmitTaskRequest) (*SubmitTaskResponse, error)
+	SubmitBatch(context.Context, *SubmitBatchRequest) (*SubmitBatchResponse, error)
+	GetPaymentStatus(context.Context, *GetStatusRequest) (*GetStatusResponse, error)
 	mustEmbedUnimplementedPaymentGatewayServer()
 }
 
@@ -72,6 +98,12 @@ type UnimplementedPaymentGatewayServer struct{}
 
 func (UnimplementedPaymentGatewayServer) SubmitTask(context.Context, *SubmitTaskRequest) (*SubmitTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitTask not implemented")
+}
+func (UnimplementedPaymentGatewayServer) SubmitBatch(context.Context, *SubmitBatchRequest) (*SubmitBatchResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitBatch not implemented")
+}
+func (UnimplementedPaymentGatewayServer) GetPaymentStatus(context.Context, *GetStatusRequest) (*GetStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPaymentStatus not implemented")
 }
 func (UnimplementedPaymentGatewayServer) mustEmbedUnimplementedPaymentGatewayServer() {}
 func (UnimplementedPaymentGatewayServer) testEmbeddedByValue()                        {}
@@ -112,6 +144,42 @@ func _PaymentGateway_SubmitTask_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PaymentGateway_SubmitBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentGatewayServer).SubmitBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentGateway_SubmitBatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentGatewayServer).SubmitBatch(ctx, req.(*SubmitBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PaymentGateway_GetPaymentStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentGatewayServer).GetPaymentStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentGateway_GetPaymentStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentGatewayServer).GetPaymentStatus(ctx, req.(*GetStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PaymentGateway_ServiceDesc is the grpc.ServiceDesc for PaymentGateway service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -122,6 +190,14 @@ var PaymentGateway_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SubmitTask",
 			Handler:    _PaymentGateway_SubmitTask_Handler,
+		},
+		{
+			MethodName: "SubmitBatch",
+			Handler:    _PaymentGateway_SubmitBatch_Handler,
+		},
+		{
+			MethodName: "GetPaymentStatus",
+			Handler:    _PaymentGateway_GetPaymentStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
