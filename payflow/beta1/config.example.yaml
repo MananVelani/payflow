@@ -1,0 +1,66 @@
+# PayFlow C3 Worker Service Configuration Example
+
+# Coordinator Address (Required)
+# COORDINATOR_ADDR: localhost:50051
+
+# Log Service Address (Required)
+# LOG_SERVICE_ADDR: localhost:50052
+
+# Bank API Address (Required)
+# BANK_API_ADDR: http://localhost:8080
+
+# Worker ID (Optional, defaults to UUID)
+# WORKER_ID: worker-01
+
+# Worker Token (Required for Auth)
+# WORKER_TOKEN: secret-token
+
+# Log Level (debug, info, warn, error)
+LOG_LEVEL: info
+
+# gRPC Port (for worker management, 0 for random)
+GRPC_PORT: 0
+
+# Metrics Port (Prometheus)
+METRICS_PORT: 9092
+
+# Health Port (/healthz, /readyz)
+HEALTH_PORT: "8090"
+
+# Heartbeat Interval
+HEARTBEAT_INTERVAL: 2s
+
+# Bank Mock Settings
+BANK_FAIL_RATE: 0.10
+BANK_LATENCY_MIN_MS: 50
+BANK_LATENCY_MAX_MS: 500
+
+# Concurrency
+MAX_CONCURRENT_TASKS: 10
+MAX_TASK_DURATION: 60s
+SHUTDOWN_TIMEOUT: 10s
+
+# Resilience
+RETRY_MAX_ATTEMPTS: 5
+RETRY_BASE_DELAY: 100ms
+RETRY_MAX_DELAY: 30s
+CB_MAX_REQUESTS: 5
+CB_FAILURE_THRESHOLD: 0.5
+CB_TIMEOUT: 30s
+
+# Stream
+KEEPALIVE_TIME: 10s
+KEEPALIVE_TIMEOUT: 5s
+CONNECT_RETRY_DELAY: 2s
+
+# Outbox
+OUTBOX_FLUSH_INTERVAL: 5s
+OUTBOX_MAX_SIZE: 1000
+OUTBOX_DB_PATH: /var/data/c3/outbox
+
+# Reservation
+REQUIRE_REDIS: false
+RESERVATION_REDIS_URL: ""
+
+# Week 3: Retry Engine
+RETRY_TASK_MAX_ATTEMPTS: 3
