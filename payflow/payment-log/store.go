@@ -38,28 +38,36 @@ func (s *Store) Save(txnID string, data interface{}) {
 	})
 }
 
-func(s *Store) CheckIdempotency(key string) (bool, string, bool) {
-	var taxnID string
+func (s *Store) CheckIdempotency(key string) (bool, string, bool) {
+	var txnID string
 	var success bool
+
 	s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(idempotencyBucket)
 		data := b.Get([]byte(key))
 		if data == nil {
-			return nil;
+			return nil
 		}
+
 		var result struct {
-			TxnID   string
+			TxnID  string
 			Success bool
 		}
-		json.Unmarshal(data, &result)
-		taxnID = result.TxnID
+
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil
+		}
+
+		txnID = result.TxnID
 		success = result.Success
 		return nil
 	})
-	if taxnID == "" {
+
+	if txnID == "" {
 		return false, "", false
 	}
-	return true, taxnID, success
+
+	return true, txnID, success
 }
 
 func (s *Store) WriteResult(key, txnID string, success bool) {
@@ -76,4 +84,35 @@ func (s *Store) WriteResult(key, txnID string, success bool) {
 
 		return b.Put([]byte(key), data)
 	})
+}
+
+func (s *Store) GetAllPending(epoch int64) []interface{} {
+	var results []interface{}
+
+	s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+
+		b.ForEach(func(k, v []byte) error {
+			var entry map[string]interface{}
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return nil
+			}
+
+			state, _ := entry["state"].(string)
+			entryEpoch, _ := entry["epoch"].(float64)
+
+			// Filter: same epoch + unfinished
+			if int64(entryEpoch) == epoch &&
+				(state == "QUEUED" || state == "IN_PROGRESS") {
+
+				results = append(results, entry)
+			}
+
+			return nil
+		})
+
+		return nil
+	})
+
+	return results
 }
