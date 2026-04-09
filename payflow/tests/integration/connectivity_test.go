@@ -31,18 +31,20 @@ func TestAllServicesHealthy(t *testing.T) {
 }
 
 // TestMonitorWebSocketConnects verifies that the Monitor WebSocket endpoint
-// accepts connections and sends heartbeat messages containing the expected payload.
+// accepts connections and sends dashboard messages (snapshot or ping).
 func TestMonitorWebSocketConnects(t *testing.T) {
 	conn := helpers.ConnectWebSocket(t, MonitorWsURL, 30*time.Second)
 	defer conn.Close()
 
-	// Wait for a heartbeat message (broadcast every 5s)
+	// Wait for a dashboard message (ping every 5s, snapshots on scrape updates)
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	assert.NoError(t, err, "should receive a WebSocket message")
 
 	msgStr := string(msg)
-	assert.Contains(t, msgStr, `"type":"heartbeat"`, "message should be a heartbeat")
+	isPing := strings.Contains(msgStr, `"type":"ping"`)
+	isSnapshot := strings.Contains(msgStr, `"type":"snapshot"`)
+	assert.True(t, isPing || isSnapshot, "message should be ping or snapshot")
 	t.Logf("Received WebSocket message: %s", msgStr)
 }
 
@@ -83,6 +85,7 @@ func TestPayflowNetworkConnectivity(t *testing.T) {
 		{"localhost", "50054", "payment-log gRPC"},
 		{"localhost", "8080", "api-gateway HTTP"},
 		{"localhost", "3000", "monitor HTTP"},
+		{"localhost", "9999", "mock-bank HTTP"},
 	}
 
 	failCount := 0

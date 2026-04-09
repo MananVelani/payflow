@@ -179,7 +179,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "1"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-1"
 
   worker-2:
@@ -187,7 +187,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "2"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-2"
 
   worker-3:
@@ -195,7 +195,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "3"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-3"
 
   worker-4:
@@ -203,7 +203,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "4"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-4"
 
   worker-5:
@@ -211,7 +211,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "5"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-5"
 
   # ─────────────────────────────────────────────────────────
@@ -261,6 +261,11 @@ services:
       HTTP_PORT: "3000"
       PROMETHEUS_PORT: "9091"
       SCRAPE_INTERVAL: "15s"
+      SCALING_ENABLED: "true"
+      SCALING_QUEUE_THRESHOLD: "50"
+      SCALING_MAX_WORKERS: "10"
+      SCALING_COOLDOWN: "30s"
+      SCALING_TEMPLATE_WORKER: "worker-1"
       SCRAPE_TARGETS: >-
         http://api-gateway:8080/metrics,
         http://coordinator-1:2112/metrics,
@@ -274,6 +279,8 @@ services:
         http://worker-5:2112/metrics
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       OTEL_SERVICE_NAME: "monitor"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 10s
@@ -288,6 +295,34 @@ services:
         limits:
           cpus: "0.5"
           memory: "256M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+  # ─────────────────────────────────────────────────────────
+  # Supporting: Mock Bank API (simulates external payment gateway)
+  # Uses placeholder service - workers call /v1/payments endpoint
+  # ─────────────────────────────────────────────────────────
+  mock-bank:
+    build:
+      context: ./payflow/placeholder
+      dockerfile: Dockerfile
+    ports:
+      - "9999:9999"
+    environment:
+      PORT: "9999"
+      METRICS_PORT: "2113"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9999/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "64M"
     restart: unless-stopped
     networks:
       - payflow-net

@@ -1,7 +1,7 @@
 # Placeholder Dockerfile for PayFlow services (Members 1-4)
 # Each member copies this into their service directory and replaces with real code in Weeks 2-3.
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /build
 COPY main.go .
 RUN go mod init placeholder && \
