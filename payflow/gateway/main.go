@@ -174,8 +174,8 @@ func main() {
 				return
 			}
 
-			if resp.LeaderAddress != "" {
-				gw.updateLeader(resp.LeaderAddress)
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
 				continue
 			}
 
@@ -249,8 +249,8 @@ func main() {
 				return
 			}
 
-			if resp.LeaderAddress != "" {
-				gw.updateLeader(resp.LeaderAddress)
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
 				continue
 			}
 			break
@@ -263,8 +263,8 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"txn_id": resp.TxnId,
-			"status": resp.Status,
+			"txn_id": resp.GetTxnId(),
+			"status": resp.GetStatus(),
 			"trace_id": span.SpanContext().TraceID().String(),
 		})
 	})
@@ -323,8 +323,8 @@ func main() {
 				return
 			}
 
-			if resp.LeaderAddress != "" {
-				gw.updateLeader(resp.LeaderAddress)
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
 				continue
 			}
 			break
