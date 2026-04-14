@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -40,6 +41,14 @@ type Gateway struct {
 	conn       *grpc.ClientConn
 	client     pb.PaymentGatewayClient
 	mu         sync.Mutex
+}
+
+var gatewayRequestTotal uint64
+
+var coordinatorCandidates = []string{
+	"coordinator-1:50051",
+	"coordinator-2:50052",
+	"coordinator-3:50053",
 }
 
 func initTracer() (*sdktrace.TracerProvider, error) {
@@ -77,7 +86,7 @@ func (gw *Gateway) connect(addr string) {
 		gw.conn.Close()
 	}
 	// A05 trace_id propagation via gRPC metadata
-	conn, err := grpc.Dial(addr, 
+	conn, err := grpc.Dial(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
@@ -99,10 +108,50 @@ func (gw *Gateway) updateLeader(addr string) {
 	}
 }
 
+func (gw *Gateway) rotateLeader() {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+
+	idx := -1
+	for i, addr := range coordinatorCandidates {
+		if addr == gw.leaderAddr {
+			idx = i
+			break
+		}
+	}
+
+	nextIdx := 0
+	if idx >= 0 {
+		nextIdx = (idx + 1) % len(coordinatorCandidates)
+	}
+
+	next := coordinatorCandidates[nextIdx]
+	log.Printf("Leader unknown, rotating coordinator target to: %s", next)
+	gw.connect(next)
+}
+
 func (gw *Gateway) getClient() pb.PaymentGatewayClient {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 	return gw.client
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"service": "api-gateway",
+	})
+}
+
+func handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	total := atomic.LoadUint64(&gatewayRequestTotal)
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "# HELP payflow_gateway_requests_total Total HTTP requests handled by the API gateway.\n")
+	fmt.Fprintf(w, "# TYPE payflow_gateway_requests_total counter\n")
+	fmt.Fprintf(w, "payflow_gateway_requests_total %d\n", total)
 }
 
 func main() {
@@ -119,7 +168,11 @@ func main() {
 	tracer := otel.Tracer("payflow/gateway")
 	gw := NewGateway("coordinator-1:50051")
 
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/metrics", handleMetrics)
+
 	http.HandleFunc("/v1/payments", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -154,12 +207,19 @@ func main() {
 
 			if err != nil {
 				span.RecordError(err)
-				if strings.Contains(err.Error(), "NOT_LEADER") {
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
 					parts := strings.Split(err.Error(), "|")
 					if len(parts) > 1 {
 						gw.updateLeader(parts[1])
 						continue
 					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
 				}
 				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
 				return
@@ -171,8 +231,9 @@ func main() {
 			}
 
 			if resp.GetErrorMessage() != "" {
-				if strings.Contains(resp.GetErrorMessage(), "NOT_LEADER") {
-					gw.connect("coordinator-2:50052")
+				errMsg := strings.ToUpper(resp.GetErrorMessage())
+				if strings.Contains(errMsg, "NOT_LEADER") || strings.Contains(strings.ToLower(resp.GetErrorMessage()), "not the leader") {
+					gw.rotateLeader()
 					continue
 				}
 				span.SetAttributes(attribute.String("error.msg", resp.GetErrorMessage()))
@@ -186,18 +247,19 @@ func main() {
 			http.Error(w, "Max retries exceeded", http.StatusServiceUnavailable)
 			return
 		}
-		
+
 		span.SetAttributes(attribute.String("txn_id", resp.GetTxnId()))
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"txn_id": resp.GetTxnId(),
-			"status": "QUEUED",
+			"txn_id":   resp.GetTxnId(),
+			"status":   "QUEUED",
 			"trace_id": span.SpanContext().TraceID().String(),
 		})
 	})
 
 	http.HandleFunc("/v1/payments/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -229,12 +291,19 @@ func main() {
 
 			if err != nil {
 				span.RecordError(err)
-				if strings.Contains(err.Error(), "NOT_LEADER") {
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
 					parts := strings.Split(err.Error(), "|")
 					if len(parts) > 1 {
 						gw.updateLeader(parts[1])
 						continue
 					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
 				}
 				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
 				return
@@ -254,13 +323,14 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"txn_id": resp.GetTxnId(),
-			"status": resp.GetStatus(),
+			"txn_id":   resp.GetTxnId(),
+			"status":   resp.GetStatus(),
 			"trace_id": span.SpanContext().TraceID().String(),
 		})
 	})
 
 	http.HandleFunc("/v1/batch", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -303,12 +373,19 @@ func main() {
 
 			if err != nil {
 				span.RecordError(err)
-				if strings.Contains(err.Error(), "NOT_LEADER") {
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
 					parts := strings.Split(err.Error(), "|")
 					if len(parts) > 1 {
 						gw.updateLeader(parts[1])
 						continue
 					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
 				}
 				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
 				return
@@ -329,16 +406,16 @@ func main() {
 		results := make([]map[string]interface{}, 0)
 		for _, r := range resp.Responses {
 			results = append(results, map[string]interface{}{
-				"txn_id": r.GetTxnId(),
+				"txn_id":  r.GetTxnId(),
 				"success": r.GetSuccess(),
-				"error": r.GetErrorMessage(),
+				"error":   r.GetErrorMessage(),
 			})
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"batch_results": results,
-			"trace_id": span.SpanContext().TraceID().String(),
+			"trace_id":      span.SpanContext().TraceID().String(),
 		})
 	})
 

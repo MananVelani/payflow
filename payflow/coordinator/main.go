@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,30 @@ var clusterPeers = map[string]string{
 	"coordinator-1": "127.0.0.1:50051",
 	"coordinator-2": "127.0.0.1:50052",
 	"coordinator-3": "127.0.0.1:50053",
+}
+
+func parsePeerMapFromEnv() map[string]string {
+	raw := strings.TrimSpace(os.Getenv("PEERS"))
+	if raw == "" {
+		return clusterPeers
+	}
+
+	peerMap := make(map[string]string)
+	parts := strings.Split(raw, ",")
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		host := strings.Split(addr, ":")[0]
+		peerMap[host] = addr
+	}
+
+	if len(peerMap) == 0 {
+		return clusterPeers
+	}
+
+	return peerMap
 }
 
 // CoordinatorNode implements all 3 required server interfaces
@@ -87,11 +112,11 @@ func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMes
 			Ok:    false, // Do not agree to the election!
 		}, nil
 	}
-	
+
 	// CRITICAL FIX 2: Mathematical ID comparison instead of string comparison
 	myID := parseNodeID(c.ID)
 	candidateID := parseNodeID(req.CandidateId)
-	
+
 	if req.Epoch > c.Epoch {
 		log.Printf("[DEBUG-TRACE] Node %s | ADOPTING HIGHER EPOCH: %d -> %d", c.ID, c.Epoch, req.Epoch)
 		c.Epoch = req.Epoch
@@ -241,12 +266,13 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 		}, nil
 	case <-time.After(1 * time.Second):
 		// The queue filled up during the split-second we were writing to the database.
-		// We drop the memory operation to prevent a goroutine leak. 
+		// We drop the memory operation to prevent a goroutine leak.
 		// The task is safe in the C4 WAL and will be recovered on the next leader election.
 		log.Printf("[LEADER %s] CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
 		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, task %s recorded but delayed", txnID)
 	}
 }
+
 // ---------------------------------------------------------
 // 3. WORKER MANAGEMENT SERVICE (From C3 Workers)
 // ---------------------------------------------------------
@@ -304,7 +330,7 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 
 				// If we step down, this specific peer's goroutine quietly exits
 				if state != "LEADER" {
-					return 
+					return
 				}
 
 				// Strict 1-second timeout prevents overlapping network hangs
@@ -314,7 +340,7 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 					LeaderId: c.ID,
 				})
 				cancel() // Always cancel context after the call
-				
+
 				if err != nil {
 					// Peer is down, but we don't leak goroutines waiting for them
 				}
@@ -349,8 +375,8 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	// FIX: Removed the Dial/NewClient block to prevent connection exhaustion
 	if c.c4Client != nil {
 		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
-			TxnId:   req.TaskId,
-			Success: isSuccess,
+			TxnId:          req.TaskId,
+			Success:        isSuccess,
 			IdempotencyKey: req.GetIdempotencyKey(),
 		})
 
@@ -476,14 +502,14 @@ func (c *CoordinatorNode) StartLeaderMonitor() {
 // triggerElection safely updates the state and prepares to fight for leadership
 func (c *CoordinatorNode) triggerElection() {
 	c.mu.Lock()
-	
+
 	// If we are already the leader, we don't need to overthrow ourselves
 	if c.State == "LEADER" || c.State == "CANDIDATE" {
 		log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Election trigger ignored", c.ID, c.State, c.Epoch)
 		c.mu.Unlock()
 		return
 	}
-	
+
 	oldState := c.State
 	// Transition to CANDIDATE and increment our Epoch
 	c.State = "CANDIDATE"
@@ -693,9 +719,9 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 
 		// 5. Reconstruct the TaskAssignment
 		recoveredTask := &workerPb.TaskAssignment{
-			Epoch:  c.Epoch, // Stamp it with the NEW leader's epoch
-			TaskId: entry.TxnId,
-			Amount: amount,
+			Epoch:          c.Epoch, // Stamp it with the NEW leader's epoch
+			TaskId:         entry.TxnId,
+			Amount:         amount,
 			Currency:       currency,
 			MerchantId:     merchantID,
 			IdempotencyKey: idempotencyKey,
@@ -714,7 +740,7 @@ func (c *CoordinatorNode) rebuildQueueFromC4() {
 // checkAndBecomeLeader prevents stale goroutines from hijacking the cluster
 func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
 	c.mu.Lock()
-	// CRITICAL FIX: If our epoch changed or we were forced to step down 
+	// CRITICAL FIX: If our epoch changed or we were forced to step down
 	// while waiting for the network, ABORT the takeover!
 	if c.State != "CANDIDATE" {
 		log.Printf("[Node %s] Election aborted. Current state: %s. Current Epoch: %d. Election Epoch: %d", c.ID, c.State, c.Epoch, electionEpoch)
@@ -722,7 +748,7 @@ func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
 		return
 	}
 	c.mu.Unlock()
-	
+
 	// We are still the valid candidate. Claim the throne!
 	c.becomeLeader()
 }
@@ -738,7 +764,7 @@ func (c *CoordinatorNode) becomeLeader() {
 	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, c.Epoch)
 	go c.startLeaderHeartbeat()
 	go c.startWorkerMonitor()
-	
+
 	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
 	go c.rebuildQueueFromC4() // Recovery Function
 }
@@ -750,7 +776,12 @@ func main() {
 
 	log.Printf("Booting up node %s... Connecting to C4 Database...", *idFlag)
 	var c4Client logPb.PaymentLogServiceClient // Declare variable
-	c4Conn, err := grpc.NewClient("localhost:50054", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c4Addr := strings.TrimSpace(os.Getenv("PAYMENT_LOG_ADDR"))
+	if c4Addr == "" {
+		c4Addr = "payment-log:50054"
+	}
+
+	c4Conn, err := grpc.NewClient(c4Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
 	if err == nil {
 		defer c4Conn.Close()
@@ -759,8 +790,9 @@ func main() {
 	}
 
 	// Set up the persistent peer connection pool
+	peerAddrs := parsePeerMapFromEnv()
 	peerClients := make(map[string]coordPb.CoordinatorClusterClient)
-	for id, addr := range clusterPeers {
+	for id, addr := range peerAddrs {
 		if id == *idFlag {
 			continue // Don't dial ourselves
 		}

@@ -1,18 +1,21 @@
-# Placeholder Dockerfile for PayFlow services (Members 1-4)
-# Each member copies this into their service directory and replaces with real code in Weeks 2-3.
+# C2 Coordinator Dockerfile
 
-FROM golang:1.22-alpine AS builder
-WORKDIR /build
-COPY main.go .
-RUN go mod init placeholder && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /placeholder .
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+RUN apk add --no-cache git
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY proto ./proto
+COPY coordinator ./coordinator
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /coordinator ./coordinator
 
 FROM alpine:3.19 AS final
-RUN apk add --no-cache ca-certificates wget
+RUN apk add --no-cache ca-certificates wget busybox-extras iproute2
 RUN adduser -D -u 1001 app
-COPY --from=builder /placeholder /placeholder
+COPY --from=builder /coordinator /coordinator
 USER app
-EXPOSE 8080 2112
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
-ENTRYPOINT ["/placeholder"]
+EXPOSE 50051 2112
+ENTRYPOINT ["/coordinator"]
