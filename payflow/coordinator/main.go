@@ -288,6 +288,10 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 
 // startLeaderHeartbeat continuously suppresses follower elections
 func (c *CoordinatorNode) startLeaderHeartbeat() {
+	c.mu.Lock()
+	startingEpoch := c.Epoch
+	c.mu.Unlock()
+
 	log.Printf("[LEADER %s] Starting dedicated per-peer heartbeat tickers...", c.ID)
 
 	for peerID, client := range c.peerClients {
@@ -299,18 +303,18 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 			for range ticker.C {
 				c.mu.Lock()
 				state := c.State
-				epoch := c.Epoch
+				curEpoch := c.Epoch
 				c.mu.Unlock()
 
 				// If we step down, this specific peer's goroutine quietly exits
-				if state != "LEADER" {
+				if state != "LEADER" || curEpoch != startingEpoch {
 					return 
 				}
 
 				// Strict 1-second timeout prevents overlapping network hangs
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				_, err := cli.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
-					Epoch:    epoch,
+					Epoch:    curEpoch,
 					LeaderId: c.ID,
 				})
 				cancel() // Always cancel context after the call
@@ -599,6 +603,10 @@ func (c *CoordinatorNode) broadcastCoordinator() {
 
 // startWorkerMonitor sweeps the worker pool to detect crashed containers
 func (c *CoordinatorNode) startWorkerMonitor() {
+	c.mu.Lock()
+	startingEpoch := c.Epoch
+	c.mu.Unlock()
+
 	log.Printf("[LEADER %s] Starting worker heartbeat monitor...", c.ID)
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -607,8 +615,9 @@ func (c *CoordinatorNode) startWorkerMonitor() {
 	for range ticker.C {
 		c.mu.Lock()
 
-		if c.State != "LEADER" {
-			log.Printf("[Node %s] Stepped down. Stopping worker monitor.", c.ID)
+		if c.State != "LEADER" || c.Epoch != startingEpoch {
+			log.Printf("[Node %s] Stepped down or epoch changed. Stopping worker monitor for Epoch %d.", c.ID, startingEpoch)
+			c.mu.Unlock()
 			return
 		}
 
