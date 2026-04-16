@@ -9,7 +9,10 @@
 
 x-coordinator-base: &coordinator-base
   build:
-    context: ./payflow/coordinator
+    context: ./payflow
+    dockerfile: coordinator/Dockerfile
+  cap_add:
+    - NET_ADMIN
   deploy:
     resources:
       limits:
@@ -29,7 +32,10 @@ x-coordinator-base: &coordinator-base
 
 x-worker-base: &worker-base
   build:
-    context: ./payflow/worker
+    context: ./payflow
+    dockerfile: worker/Dockerfile
+  cap_add:
+    - NET_ADMIN
   deploy:
     resources:
       limits:
@@ -68,7 +74,10 @@ services:
   # ─────────────────────────────────────────────────────────
   api-gateway:
     build:
-      context: ./payflow/gateway
+      context: ./payflow
+      dockerfile: gateway/Dockerfile
+    cap_add:
+      - NET_ADMIN
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -107,6 +116,7 @@ services:
   # ─────────────────────────────────────────────────────────
   coordinator-1:
     <<: *coordinator-base
+    command: ["--id=coordinator-1", "--port=:50051"]
     ports:
       - "50051:50051"
       - "2112:2112"
@@ -129,6 +139,7 @@ services:
 
   coordinator-2:
     <<: *coordinator-base
+    command: ["--id=coordinator-2", "--port=:50052"]
     ports:
       - "50052:50052"
       - "2153:2112"
@@ -151,6 +162,7 @@ services:
 
   coordinator-3:
     <<: *coordinator-base
+    command: ["--id=coordinator-3", "--port=:50053"]
     ports:
       - "50053:50053"
       - "2154:2112"
@@ -179,7 +191,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "1"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-1"
 
   worker-2:
@@ -187,7 +199,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "2"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-2"
 
   worker-3:
@@ -195,7 +207,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "3"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-3"
 
   worker-4:
@@ -203,7 +215,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "4"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-4"
 
   worker-5:
@@ -211,7 +223,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "5"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-5"
 
   # ─────────────────────────────────────────────────────────
@@ -219,7 +231,10 @@ services:
   # ─────────────────────────────────────────────────────────
   payment-log:
     build:
-      context: ./payflow/payment-log
+      context: ./payflow
+      dockerfile: payment-log/Dockerfile
+    cap_add:
+      - NET_ADMIN
     ports:
       - "50054:50054"
       - "2113:2113"
@@ -234,7 +249,7 @@ services:
     volumes:
       - payflow-bolt:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:2113/health"]
+      test: ["CMD-SHELL", "nc -z localhost 50054 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -254,6 +269,8 @@ services:
   monitor:
     build:
       context: ./payflow/monitor
+    cap_add:
+      - NET_ADMIN
     ports:
       - "3000:3000"
       - "9091:9091"

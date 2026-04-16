@@ -56,7 +56,6 @@ func main() {
 	// Main mux: dashboard + health + WebSocket + API state (port 3000)
 	mainMux := http.NewServeMux()
 	mainMux.HandleFunc("/health", healthHandler)
-	mainMux.HandleFunc("/api/state", dash.HandleAPIState)
 	dash.RegisterRoutes(mainMux)
 
 	// Prometheus mux: /metrics endpoint (port 9091)
