@@ -6,10 +6,17 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"github.com/your-org/payflow/worker/internal/concurrency"
 )
 
+type mockWorker struct{}
+
+func (m *mockWorker) ResetBankBreaker()                              {}
+func (m *mockWorker) SetBackpressureMode(concurrency.BackpressureMode) {}
+
 func TestHandler_Healthz(t *testing.T) {
-	h := NewHandler(nil, nil, nil, nil)
+	h := NewHandler(nil, nil, nil, nil, &mockWorker{})
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
 
@@ -34,7 +41,7 @@ func TestHandler_Readyz(t *testing.T) {
 	readyCh := make(chan struct{})
 	var grpcReady atomic.Bool
 
-	h := NewHandler(outboxRunning.Load, readyCh, grpcReady.Load, nil)
+	h := NewHandler(outboxRunning.Load, readyCh, grpcReady.Load, nil, &mockWorker{})
 
 	// Subtest 1: Initially not ready (gRPC not ready)
 	{

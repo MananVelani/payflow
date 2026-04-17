@@ -2,7 +2,6 @@ package stream
 
 import (
 	"context"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -10,6 +9,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+
+	"github.com/your-org/payflow/worker/internal/resilience"
 )
 
 var (
@@ -36,24 +37,24 @@ func ConnectWithRetry(ctx context.Context, addr string, keepaliveTime, keepalive
 	}
 	opts = append(opts, dialOptions...)
 
-	for {
+	var conn *grpc.ClientConn
+	operation := func() error {
 		log.Info("attempting to connect to coordinator", zap.String("addr", addr))
-		// Use NewClient (modern gRPC) instead of Dial
-		conn, err := grpc.NewClient(addr, opts...)
-		if err == nil {
-			readyOnce.Do(func() { close(readyCh) })
-			return conn, nil
+		var err error
+		conn, err = grpc.NewClient(addr, opts...)
+		if err != nil {
+			return err
 		}
-
-		// Jittered backoff: retryDelay +/- 50%
-		jitter := time.Duration(float64(retryDelay) * (0.5 + rand.Float64()))
-		select {
-		case <-time.After(jitter):
-			continue
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		readyOnce.Do(func() { close(readyCh) })
+		return nil
 	}
+
+	// Max delay for coordinator reconnection capped at 30s
+	err := resilience.ExecuteInfiniteRetry(ctx, operation, retryDelay, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // RegisterFunc is any function that performs a gRPC registration/heartbeat.
@@ -61,20 +62,14 @@ type RegisterFunc func(context.Context) error
 
 // RegisterWithRetry keeps trying a registration function until success.
 func RegisterWithRetry(ctx context.Context, name string, fn RegisterFunc, retryDelay time.Duration, log *zap.Logger) {
-	for {
+	operation := func() error {
 		err := fn(ctx)
-		if err == nil {
-			log.Info("registration successful", zap.String("service", name))
-			return
+		if err != nil {
+			return err
 		}
-
-		// Jittered backoff: retryDelay +/- 50%
-		jitter := time.Duration(float64(retryDelay) * (0.5 + rand.Float64()))
-		select {
-		case <-time.After(jitter):
-			continue
-		case <-ctx.Done():
-			return
-		}
+		log.Info("registration successful", zap.String("service", name))
+		return nil
 	}
+
+	_ = resilience.ExecuteInfiniteRetry(ctx, operation, retryDelay, 30*time.Second)
 }

@@ -367,7 +367,7 @@ func NewHarness(t *testing.T, customCfg *config.Config) *Harness {
 		cfg.MaxTaskDuration,
 		obsMetrics.WorkerSaturation,
 		obsMetrics.OrphanedLeaseCount,
-		slog.Default(),
+		zapLogger,
 	)
 	registry := concurrency.NewTaskRegistry()
 
