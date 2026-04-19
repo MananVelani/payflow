@@ -86,6 +86,18 @@ func (s *LogServer) GetAllPending(req *pb.PendingRequest, stream pb.PaymentLogSe
 	return nil
 }
 
+func (s *LogServer) GetEpoch(ctx context.Context, req *pb.EmptyRequest) (*pb.EpochResponse, error) {
+	epoch := s.store.GetEpoch()
+	log.Printf("[GetEpoch] Returned Epoch: %d", epoch)
+	return &pb.EpochResponse{Epoch: epoch}, nil
+}
+
+func (s *LogServer) SaveEpoch(ctx context.Context, req *pb.EpochRequest) (*pb.WriteResultAck, error) {
+	s.store.SaveEpoch(req.Epoch)
+	log.Printf("[SaveEpoch] Persisted Epoch: %d", req.Epoch)
+	return &pb.WriteResultAck{Acknowledged: true}, nil
+}
+
 // -------------------- Main --------------------
 
 func main() {

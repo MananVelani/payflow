@@ -19,6 +19,10 @@ service PaymentLogService {
     rpc HandlePrepare(TxnRequest) returns (TxnResponse);
     rpc HandleCommit(TxnRequest) returns (TxnResponse);
     rpc HandleRollback(TxnRequest) returns (TxnResponse);
+    
+    // Epoch State Recovery
+    rpc GetEpoch(EmptyRequest) returns (EpochResponse);
+    rpc SaveEpoch(EpochRequest) returns (WriteResultAck);
 }
 
 message LogEntry {
@@ -75,4 +79,14 @@ message TxnRequest {
 
 message TxnResponse {
     bool success = 1;
+}
+
+message EmptyRequest {}
+
+message EpochRequest {
+    int64 epoch = 1;
+}
+
+message EpochResponse {
+    int64 epoch = 1;
 }

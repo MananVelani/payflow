@@ -518,6 +518,7 @@ func (c *CoordinatorNode) triggerElection() {
 	// Transition to CANDIDATE and increment our Epoch
 	c.State = "CANDIDATE"
 	c.Epoch++
+	c.persistEpochToC4(c.Epoch)
 
 	currentEpoch := c.Epoch // Capture the epoch for logging before we release the lock
 	c.mu.Unlock()
@@ -774,8 +775,31 @@ func (c *CoordinatorNode) becomeLeader() {
 	go c.startLeaderHeartbeat()
 	go c.startWorkerMonitor()
 
-	log.Printf("[LEADER %s] TODO: Call C4.GetAllPending() to rebuild the task queue", c.ID)
 	go c.rebuildQueueFromC4() // Recovery Function
+}
+
+// recoverEpochFromC4 fetches the last known epoch from the Payment Log on startup.
+func (c *CoordinatorNode) recoverEpochFromC4() {
+	if c.c4Client == nil {
+		c.Epoch = 1
+		return
+	}
+	
+	res, err := c.c4Client.GetEpoch(context.Background(), &logPb.EmptyRequest{})
+	if err == nil {
+		c.Epoch = res.Epoch
+		log.Printf("[Node %s] Successfully recovered Epoch %d from C4", c.ID, c.Epoch)
+	}
+}
+
+// persistEpochToC4 saves the epoch to the database whenever it increments.
+func (c *CoordinatorNode) persistEpochToC4(newEpoch int64) {
+	if c.c4Client == nil { return }
+	
+	_, err := c.c4Client.SaveEpoch(context.Background(), &logPb.EpochRequest{Epoch: newEpoch})
+	if err != nil {
+		log.Printf("[Node %s] Error persisting epoch to C4: %v", c.ID, err)
+	}
 }
 
 func main() {
@@ -818,7 +842,7 @@ func main() {
 	node := &CoordinatorNode{
 		ID:            *idFlag,
 		State:         "FOLLOWER",
-		Epoch:         int64(1),
+		Epoch:         int64(0),
 		Workers:       make(map[string]time.Time),
 		leaderTimeout: 5 * time.Second,
 		resetTimer:    make(chan bool, 1),
@@ -828,6 +852,7 @@ func main() {
 		peerClients:   peerClients,
 	}
 
+	node.recoverEpochFromC4()
 	node.StartLeaderMonitor()
 
 	lis, err := net.Listen("tcp", *portFlag)
