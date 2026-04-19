@@ -32,8 +32,8 @@ x-coordinator-base: &coordinator-base
 
 x-worker-base: &worker-base
   build:
-    context: ./payflow
-    dockerfile: worker/Dockerfile
+    context: ./payflow/worker
+    dockerfile: Dockerfile
   cap_add:
     - NET_ADMIN
   deploy:
@@ -60,12 +60,15 @@ x-worker-base: &worker-base
 
 x-worker-env: &worker-env
   METRICS_PORT: "2112"
-  COORDINATOR_ADDRS: "coordinator-1:50051,coordinator-2:50052,coordinator-3:50053"
+  COORDINATOR_ADDR: "coordinator-1:50051"
+  LOG_SERVICE_ADDR: "payment-log:50054"
   HEARTBEAT_INTERVAL: "2s"
-  BANK_API_URL: "http://mock-bank:9999"
-  BANK_API_LATENCY_MIN_MS: "50"
-  BANK_API_LATENCY_MAX_MS: "500"
-  BANK_FAILURE_RATE: "0.10"
+  BANK_API_ADDR: "http://mock-bank:9999"
+  BANK_LATENCY_MIN_MS: "50"
+  BANK_LATENCY_MAX_MS: "500"
+  BANK_FAIL_RATE: "0.10"
+  WORKER_TOKEN: "secret-token"
+  OUTBOX_DB_PATH: "/tmp/outbox"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
 
 services:

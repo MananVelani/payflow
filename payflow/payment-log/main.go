@@ -24,10 +24,10 @@ func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.Appe
 	log.Println("[AppendEntry] Saving txn:", req.TxnId)
 
 	// Save transaction log
-	s.store.Save(req.TxnId, req)
+	seq := s.store.Save(req.TxnId, req)
 
 	return &pb.AppendResponse{
-		LogIndex: 1, // TODO: replace with real index later
+		LogIndex: int64(seq), // Real auto-incremented BoltDB index
 		Success:  true,
 	}, nil
 }

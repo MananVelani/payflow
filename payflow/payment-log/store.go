@@ -30,12 +30,15 @@ func NewStore() *Store {
 	return &Store{db: db}
 }
 
-func (s *Store) Save(txnID string, data interface{}) {
+func (s *Store) Save(txnID string, data interface{}) uint64 {
+	var seq uint64
 	s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucket)
+		seq, _ = b.NextSequence()
 		bytes, _ := json.Marshal(data)
 		return b.Put([]byte(txnID), bytes)
 	})
+	return seq
 }
 
 func (s *Store) CheckIdempotency(key string) (bool, string, bool) {
@@ -99,7 +102,7 @@ func (s *Store) GetAllPending(epoch int64) []interface{} {
 			}
 
 			state, _ := entry["state"].(string)
-			entryEpoch, _ := entry["epoch"].(float64)
+			// (Removed entryEpoch parsing since we want tasks from all epochs)
 
 			if state == "QUEUED" || state == "IN_PROGRESS" {
 

@@ -1,22 +1,30 @@
-# C3 Worker Dockerfile
-
-FROM golang:1.25-alpine AS builder
-WORKDIR /src
-RUN apk add --no-cache git
-
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM golang:alpine AS builder
+WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
+COPY . .
 
-COPY worker ./worker
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+  -ldflags="-w -s" \
+  -o /worker \
+  ./cmd/worker
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /worker ./worker
+# ── Stage 2: Final Image ──────────────────────────────────────────────────────
+# Using alpine for final image to support health check via wget
+FROM alpine:3.18
 
-FROM alpine:3.19 AS final
-RUN apk add --no-cache ca-certificates wget busybox-extras iproute2
-RUN adduser -D -u 1001 app
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /
 COPY --from=builder /worker /worker
-USER app
-EXPOSE 8080 2112
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
+
+# EXPOSE metrics and gRPC
+EXPOSE 9092 50053
+
+# Health check using metrics endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["wget", "--quiet", "--tries=1", "--spider", "http://localhost:9092/metrics"]
+
 ENTRYPOINT ["/worker"]
