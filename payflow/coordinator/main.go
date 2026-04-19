@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -27,6 +31,34 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
+)
+
+// ── Prometheus Metrics ──────────────────────────────────────────────────────
+var (
+	metricElections = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "payflow_coordinator_elections_total",
+		Help: "Total number of leader elections triggered by this node.",
+	})
+	metricEpoch = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_epoch",
+		Help: "Current epoch number of this coordinator node.",
+	})
+	metricQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_queue_depth",
+		Help: "Current number of tasks in the in-memory task queue.",
+	})
+	metricIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_is_leader",
+		Help: "1 if this node is currently the LEADER, 0 otherwise.",
+	})
+	metricWorkerCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_live_workers",
+		Help: "Number of workers that sent a heartbeat in the last 10 seconds.",
+	})
+	metricTasksQueued = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "payflow_coordinator_tasks_queued_total",
+		Help: "Total number of payment tasks accepted and queued.",
+	})
 )
 
 // Hardcoded cluster addresses for local IPv4 testing
@@ -249,14 +281,15 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 		TaskId:         txnID,
 		IdempotencyKey: req.IdempotencyKey,
 		Amount:         req.Amount,
-		Currency:       req.Currency,   // Point 6 fix
-		MerchantId:     req.MerchantId, // Point 6 fix
+		Currency:       req.Currency,
+		MerchantId:     req.MerchantId,
 	}
 
 	// POINT 3 FIX: Use a select statement with a strict timeout instead of an unbounded goroutine.
 	select {
 	case c.TaskQueue <- newTask:
 		// Success! The queue had space.
+		metricTasksQueued.Inc()  // ← Prometheus: count accepted tasks
 		log.Printf("[LEADER %s] Task %s enqueued. Queue size: %d", c.ID, txnID, len(c.TaskQueue))
 		return &paymentPb.SubmitTaskResponse{
 			TxnId: txnID,
@@ -485,7 +518,8 @@ func (c *CoordinatorNode) StartLeaderMonitor() {
 			currentEpoch := c.Epoch
 			c.mu.Unlock()
 
-			// Only FOLLOWERs should be monitoring for leader timeouts
+			// Only FOLLOWERs and CANDIDATEs should be monitoring for leader timeouts.
+			// If we are LEADER, just idle — the heartbeat sender is our job now.
 			if currentState == "LEADER" {
 				time.Sleep(1 * time.Second)
 				continue
@@ -493,8 +527,20 @@ func (c *CoordinatorNode) StartLeaderMonitor() {
 
 			select {
 			case <-time.After(c.leaderTimeout):
+				// Double-check the epoch hasn't advanced while we were waiting.
+				// A stale goroutine from a superseded election round must exit here.
+				c.mu.Lock()
+				epochNow := c.Epoch
+				c.mu.Unlock()
+				if epochNow != currentEpoch {
+					log.Printf("[DEBUG-TRACE] Node %s | Stale monitor goroutine (Epoch %d) exiting — current Epoch is %d", c.ID, currentEpoch, epochNow)
+					return
+				}
 				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | TIMER FIRED! No heartbeat received.", c.ID, currentState, currentEpoch)
 				c.triggerElection()
+				// Sleep through the election resolution window so we don't
+				// immediately re-arm and fire another spurious election.
+				time.Sleep(c.leaderTimeout)
 			case <-c.resetTimer:
 				// Timer was successfully reset by a heartbeat
 				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Timer reset successfully.", c.ID, currentState, currentEpoch)
@@ -522,6 +568,10 @@ func (c *CoordinatorNode) triggerElection() {
 
 	currentEpoch := c.Epoch // Capture the epoch for logging before we release the lock
 	c.mu.Unlock()
+
+	metricElections.Inc()                         // ← Prometheus: count every election
+	metricIsLeader.Set(0)                         // ← Not leader while candidate
+	metricEpoch.Set(float64(currentEpoch))        // ← Update epoch gauge
 
 	log.Printf("[DEBUG-TRACE] Node %s | STATE MUTATION: %s -> CANDIDATE | Epoch escalated to %d", c.ID, oldState, currentEpoch)
 	go c.broadcastElection()
@@ -767,11 +817,15 @@ func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
 func (c *CoordinatorNode) becomeLeader() {
 	c.mu.Lock()
 	c.State = "LEADER"
+	epoch := c.Epoch
 	c.mu.Unlock()
+
+	metricIsLeader.Set(1)                  // ← Prometheus: we are the leader
+	metricEpoch.Set(float64(epoch))        // ← Sync epoch gauge
 
 	c.broadcastCoordinator()
 
-	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, c.Epoch)
+	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, epoch)
 	go c.startLeaderHeartbeat()
 	go c.startWorkerMonitor()
 
@@ -853,6 +907,41 @@ func main() {
 	}
 
 	node.recoverEpochFromC4()
+
+	// Start Prometheus metrics HTTP server so C5 monitor can scrape live state
+	metricsPort := strings.TrimSpace(os.Getenv("METRICS_PORT"))
+	if metricsPort == "" {
+		metricsPort = "2112"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+		})
+		// Background goroutine: keep queue-depth and worker-count gauges fresh
+		go func() {
+			for range time.Tick(2 * time.Second) {
+				node.mu.Lock()
+				metricQueueDepth.Set(float64(len(node.TaskQueue)))
+				metricWorkerCount.Set(float64(len(node.Workers)))
+				metricEpoch.Set(float64(node.Epoch))
+				if node.State == "LEADER" {
+					metricIsLeader.Set(1)
+				} else {
+					metricIsLeader.Set(0)
+				}
+				node.mu.Unlock()
+			}
+		}()
+		log.Printf("[Node %s] Prometheus metrics server started on :%s", *idFlag, metricsPort)
+		if err := http.ListenAndServe(":"+metricsPort, mux); err != nil {
+			log.Printf("[Node %s] Metrics server error: %v", *idFlag, err)
+		}
+	}()
+
 	node.StartLeaderMonitor()
 
 	lis, err := net.Listen("tcp", *portFlag)

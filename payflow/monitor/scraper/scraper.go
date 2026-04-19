@@ -427,11 +427,11 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 		}
 
 		if isReachable && m != nil {
-			cs.IsLeader = getMetricVal(m, "payflow_is_leader") == 1
-			cs.Epoch = int64(getMetricVal(m, "payflow_current_epoch"))
-			cs.ElectionCount = int64(getMetricVal(m, "payflow_election_count_total"))
-			cs.QueueDepth = int64(getMetricVal(m, "payflow_task_queue_depth"))
-			cs.WorkerCount = int64(getMetricVal(m, "payflow_worker_count"))
+			cs.IsLeader = getMetricVal(m, "payflow_coordinator_is_leader") == 1
+			cs.Epoch = int64(getMetricVal(m, "payflow_coordinator_epoch"))
+			cs.ElectionCount = int64(getMetricVal(m, "payflow_coordinator_elections_total"))
+			cs.QueueDepth = int64(getMetricVal(m, "payflow_coordinator_queue_depth"))
+			cs.WorkerCount = int64(getMetricVal(m, "payflow_coordinator_live_workers"))
 
 			// Sum heartbeat misses across all worker labels
 			cs.HeartbeatMisses = 0

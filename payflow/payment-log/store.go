@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"os"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -16,7 +17,12 @@ var bucket = []byte("payments")
 var idempotencyBucket = []byte("idempotency")
 
 func NewStore() *Store {
-	db, err := bolt.Open("payments.db", 0600, nil)
+	dbPath := os.Getenv("BOLT_PATH")
+	if dbPath == "" {
+		dbPath = "payments.db"
+	}
+
+	db, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
