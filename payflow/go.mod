@@ -1,8 +1,10 @@
 module payflow
 
-go 1.24.0
+go 1.26.1
 
 require (
+	go.etcd.io/bbolt v1.4.3
+	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
