@@ -72,7 +72,7 @@ type GatewayState struct {
 // ClusterSnapshot is the aggregated state of the entire PayFlow cluster
 // at a single point in time. It is built from Prometheus scrape results.
 type ClusterSnapshot struct {
-	ScrapedAt    time.Time       `json:"scraped_at"`
+	ScrapedAt    time.Time          `json:"scraped_at"`
 	Coordinators []CoordinatorState `json:"coordinators"`
 	Workers      []WorkerState      `json:"workers"`
 	PaymentLog   PaymentLogState    `json:"payment_log"`
@@ -118,15 +118,17 @@ type TargetConfig struct {
 
 // Scraper manages periodic metric collection from all configured PayFlow services.
 type Scraper struct {
-	targets    []TargetConfig
-	client     *http.Client
-	m          *metrics.Metrics
-	interval   time.Duration
-	mu         sync.RWMutex
-	snapshot   ClusterSnapshot
-	prevEpochs map[string]int64
-	onChange   []func(ClusterSnapshot)
-	onChangeMu sync.Mutex
+	targets             []TargetConfig
+	client              *http.Client
+	m                   *metrics.Metrics
+	interval            time.Duration
+	mu                  sync.RWMutex
+	snapshot            ClusterSnapshot
+	prevEpochs          map[string]int64
+	prevCoordinatorSeen map[string]time.Time
+	prevWorkerSeen      map[string]time.Time
+	onChange            []func(ClusterSnapshot)
+	onChangeMu          sync.Mutex
 }
 
 // New creates a Scraper configured from the provided config and metrics instances.
@@ -168,12 +170,14 @@ func New(cfg *config.Config, m *metrics.Metrics) *Scraper {
 	}
 
 	return &Scraper{
-		targets:    targets,
-		client:     &http.Client{Timeout: 5 * time.Second},
-		m:          m,
-		interval:   cfg.ScrapeInterval,
-		snapshot:   ClusterSnapshot{},
-		prevEpochs: make(map[string]int64),
+		targets:             targets,
+		client:              &http.Client{Timeout: 5 * time.Second},
+		m:                   m,
+		interval:            cfg.ScrapeInterval,
+		snapshot:            ClusterSnapshot{},
+		prevEpochs:          make(map[string]int64),
+		prevCoordinatorSeen: make(map[string]time.Time),
+		prevWorkerSeen:      make(map[string]time.Time),
 	}
 }
 
@@ -280,13 +284,13 @@ func (s *Scraper) scrapeAll(ctx context.Context) {
 	roundCtx, roundCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer roundCancel()
 
-	var mu sync.Mutex
-	rawResults := make([]scrapeRawResult, 0, len(s.targets))
+	// Pre-allocate results slice to avoid mutex contention on append
+	rawResults := make([]scrapeRawResult, len(s.targets))
 
 	var wg sync.WaitGroup
-	for _, target := range s.targets {
+	for i, target := range s.targets {
 		wg.Add(1)
-		go func(t TargetConfig) {
+		go func(idx int, t TargetConfig) {
 			defer wg.Done()
 			start := time.Now()
 			parsed, err := s.scrapeOne(roundCtx, t)
@@ -296,24 +300,23 @@ func (s *Scraper) scrapeAll(ctx context.Context) {
 
 			if err != nil {
 				s.m.ScrapeTargetsUp.WithLabelValues(t.URL).Set(0)
-				s.m.ScrapeErrors.WithLabelValues(t.URL, err.Error()).Inc()
-				mu.Lock()
-				rawResults = append(rawResults, scrapeRawResult{target: t, metrics: nil, err: err, latency: latency})
-				mu.Unlock()
+				// Truncate error message to avoid high-cardinality labels
+				errReason := truncateErrorReason(err)
+				s.m.ScrapeErrors.WithLabelValues(t.URL, errReason).Inc()
+				rawResults[idx] = scrapeRawResult{target: t, metrics: nil, err: err, latency: latency}
 				return
 			}
 
 			s.m.ScrapeTargetsUp.WithLabelValues(t.URL).Set(1)
-			mu.Lock()
-			rawResults = append(rawResults, scrapeRawResult{target: t, metrics: parsed, err: nil, latency: latency})
-			mu.Unlock()
-		}(target)
+			// Direct index assignment - no mutex needed with pre-allocated slice
+			rawResults[idx] = scrapeRawResult{target: t, metrics: parsed, err: nil, latency: latency}
+		}(i, target)
 	}
 	wg.Wait()
 
 	// Build raw map keyed by URL
-	rawMap := make(map[string]map[string]float64)
-	reachableMap := make(map[string]bool)
+	rawMap := make(map[string]map[string]float64, len(s.targets))
+	reachableMap := make(map[string]bool, len(s.targets))
 	for _, r := range rawResults {
 		rawMap[r.target.URL] = r.metrics
 		reachableMap[r.target.URL] = r.err == nil
@@ -366,26 +369,40 @@ func (s *Scraper) scrapeOne(ctx context.Context, t TargetConfig) (map[string]flo
 // Lines starting with "#" (HELP, TYPE) are skipped. Empty lines are skipped.
 // Each data line is split on whitespace: first token is metric+labels, second is value.
 func parsePrometheusText(body []byte) (map[string]float64, error) {
-	result := make(map[string]float64)
+	// Estimate capacity: roughly 1 metric per 80 bytes average
+	result := make(map[string]float64, len(body)/80)
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := scanner.Bytes()
 
-		// Skip comment lines (HELP, TYPE declarations)
-		if line == "" || strings.HasPrefix(line, "#") {
+		// Skip empty lines and comments (HELP, TYPE declarations)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+
+		// Trim whitespace efficiently
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
 			continue
 		}
 
 		// Split on space — first token is metric name+labels, rest is value [timestamp]
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
+		spaceIdx := bytes.IndexByte(line, ' ')
+		if spaceIdx < 0 {
 			log.Printf("[scraper] warning: unparseable metric line: %q", line)
 			continue
 		}
 
-		metricKey := parts[0]
-		val, err := strconv.ParseFloat(parts[1], 64)
+		metricKey := string(line[:spaceIdx])
+		valueBytes := line[spaceIdx+1:]
+
+		// Find end of value (stop at next space if timestamp present)
+		if spaceIdx2 := bytes.IndexByte(valueBytes, ' '); spaceIdx2 > 0 {
+			valueBytes = valueBytes[:spaceIdx2]
+		}
+
+		val, err := strconv.ParseFloat(string(valueBytes), 64)
 		if err != nil {
 			log.Printf("[scraper] warning: unparseable value in line: %q", line)
 			continue
@@ -399,6 +416,33 @@ func parsePrometheusText(body []byte) (map[string]float64, error) {
 	}
 
 	return result, nil
+}
+
+// truncateErrorReason returns a truncated, normalized error message suitable
+// for Prometheus labels. This prevents high-cardinality label explosions from
+// unique error messages containing timestamps, IPs, or request IDs.
+func truncateErrorReason(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	msg := err.Error()
+	// Normalize common error patterns
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return "connection_refused"
+	case strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "no such host"):
+		return "dns_error"
+	case strings.Contains(msg, "EOF"):
+		return "connection_closed"
+	default:
+		// Truncate to first 50 chars to limit cardinality
+		if len(msg) > 50 {
+			return msg[:50]
+		}
+		return msg
+	}
 }
 
 // buildSnapshot constructs a ClusterSnapshot from raw scraped metric maps.
@@ -423,15 +467,17 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			NodeID:    t.Name,
 			Address:   t.URL,
 			Reachable: isReachable,
-			LastSeen:  now,
 		}
 
 		if isReachable && m != nil {
-			cs.IsLeader = getMetricVal(m, "payflow_coordinator_is_leader") == 1
-			cs.Epoch = int64(getMetricVal(m, "payflow_coordinator_epoch"))
-			cs.ElectionCount = int64(getMetricVal(m, "payflow_coordinator_elections_total"))
-			cs.QueueDepth = int64(getMetricVal(m, "payflow_coordinator_queue_depth"))
-			cs.WorkerCount = int64(getMetricVal(m, "payflow_coordinator_live_workers"))
+			cs.LastSeen = now
+			s.prevCoordinatorSeen[t.Name] = now
+
+			cs.IsLeader = getMetricVal(m, "payflow_is_leader") == 1
+			cs.Epoch = int64(getMetricVal(m, "payflow_current_epoch"))
+			cs.ElectionCount = int64(getMetricVal(m, "payflow_election_count_total"))
+			cs.QueueDepth = int64(getMetricVal(m, "payflow_task_queue_depth"))
+			cs.WorkerCount = int64(getMetricVal(m, "payflow_worker_count"))
 
 			// Sum heartbeat misses across all worker labels
 			cs.HeartbeatMisses = 0
@@ -454,6 +500,9 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			s.prevEpochs[t.Name] = cs.Epoch
 		} else {
 			cs.State = "DEAD"
+			if prev, ok := s.prevCoordinatorSeen[t.Name]; ok {
+				cs.LastSeen = prev
+			}
 		}
 
 		snap.Coordinators = append(snap.Coordinators, cs)
@@ -472,15 +521,19 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			WorkerID:  t.Name,
 			Address:   t.URL,
 			Reachable: isReachable,
-			LastSeen:  now,
 		}
 
 		if isReachable && m != nil {
+			ws.LastSeen = now
+			s.prevWorkerSeen[t.Name] = now
+
 			ws.Alive = getMetricVal(m, "payflow_worker_status") == 1
 			ws.TasksProcessed = int64(getMetricVal(m, "payflow_tasks_processed_total"))
 			ws.TasksFailed = int64(getMetricVal(m, "payflow_tasks_failed_total"))
 			ws.LatencyP50Ms = calcPercentile(m, 0.50)
 			ws.LatencyP99Ms = calcPercentile(m, 0.99)
+		} else if prev, ok := s.prevWorkerSeen[t.Name]; ok {
+			ws.LastSeen = prev
 		}
 
 		snap.Workers = append(snap.Workers, ws)

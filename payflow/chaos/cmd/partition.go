@@ -23,8 +23,15 @@ Examples:
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		nodeList := args[0]
-		nodes := strings.Split(nodeList, ",")
-		trimmedNodes := make([]string, 0, len(nodes))
+		rawNodes := strings.Split(nodeList, ",")
+		nodes := make([]string, 0, len(rawNodes))
+		for _, node := range rawNodes {
+			trimmed := strings.TrimSpace(node)
+			if trimmed == "" {
+				continue
+			}
+			nodes = append(nodes, trimmed)
+		}
 
 		if len(nodes) < 2 {
 			return fmt.Errorf("partition requires at least 2 node names, got %d", len(nodes))
@@ -32,9 +39,8 @@ Examples:
 
 		// Validate all node names
 		for _, node := range nodes {
-			trimmed := strings.TrimSpace(node)
-			if !validContainers[trimmed] {
-				return fmt.Errorf("unknown container %q; valid names: coordinator-1/2/3, worker-1..5, api-gateway, payment-log, monitor", trimmed)
+			if !validContainers[node] {
+				return fmt.Errorf("unknown container %q; valid names: coordinator-1/2/3, worker-1..5, api-gateway, payment-log, monitor", node)
 			}
 			trimmedNodes = append(trimmedNodes, trimmed)
 		}
@@ -46,8 +52,8 @@ Examples:
 		pairCount := 0
 		for i := 0; i < len(nodes); i++ {
 			for j := i + 1; j < len(nodes); j++ {
-				a := strings.TrimSpace(nodes[i])
-				b := strings.TrimSpace(nodes[j])
+				a := nodes[i]
+				b := nodes[j]
 				fmt.Printf("  🔒 %s ←✕→ %s (traffic blocked both directions)\n", a, b)
 				pairCount++
 			}
@@ -57,13 +63,16 @@ Examples:
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		if err := getDockerClient().PartitionNodes(ctx, trimmedNodes); err != nil {
-			return fmt.Errorf("applying partition: %w", err)
+		if err := getDockerClient().PartitionNodes(ctx, nodes); err != nil {
+			return fmt.Errorf("applying partition rules: %w", err)
 		}
 
-		fmt.Println("\n✅ Partition applied")
-		fmt.Println("Selected nodes were moved to an isolated partition network")
-		fmt.Println("To recover quickly, run: docker compose up -d --force-recreate")
+		if dryRun {
+			fmt.Println("\n[DRY-RUN] Partition plan validated (no live rules applied)")
+		} else {
+			fmt.Println("\n✅ Partition rules applied successfully")
+			fmt.Println("Use container restart or manual iptables cleanup to heal partition")
+		}
 		return nil
 	},
 }

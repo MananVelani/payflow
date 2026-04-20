@@ -32,7 +32,7 @@ func TestAllServicesHealthy(t *testing.T) {
 }
 
 // TestMonitorWebSocketConnects verifies that the Monitor WebSocket endpoint
-// accepts connections and sends heartbeat messages containing the expected payload.
+// accepts connections and sends dashboard messages (snapshot or ping).
 func TestMonitorWebSocketConnects(t *testing.T) {
 	conn := helpers.ConnectWebSocket(t, MonitorWsURL, 30*time.Second)
 	defer conn.Close()
@@ -95,6 +95,7 @@ func TestPayflowNetworkConnectivity(t *testing.T) {
 		{"localhost", "50054", "payment-log gRPC"},
 		{"localhost", "8080", "api-gateway HTTP"},
 		{"localhost", "3000", "monitor HTTP"},
+		{"localhost", "9999", "mock-bank HTTP"},
 	}
 
 	failCount := 0

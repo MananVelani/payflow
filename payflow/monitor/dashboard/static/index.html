@@ -437,10 +437,20 @@
                     p99El.className = "worker-stat";
                     p99El.textContent = w.alive && w.p99_ms > 0 ? ("p99: " + w.p99_ms.toFixed(0) + "ms") : "\u2014";
 
+                    var p50El = document.createElement("div");
+                    p50El.className = "worker-stat";
+                    p50El.textContent = w.alive && w.p50_ms > 0 ? ("p50: " + w.p50_ms.toFixed(0) + "ms") : "\u2014";
+
+                    var seenEl = document.createElement("div");
+                    seenEl.className = "worker-stat";
+                    seenEl.textContent = "seen " + Math.round(w.last_seen_secs || 0) + "s ago";
+
                     card.appendChild(nameEl);
                     card.appendChild(badgeEl);
                     card.appendChild(tasksEl);
                     card.appendChild(p99El);
+                    card.appendChild(p50El);
+                    card.appendChild(seenEl);
 
                     // Flash effect on update
                     if (!isNew) {

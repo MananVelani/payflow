@@ -4,6 +4,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -20,6 +21,13 @@ import (
 //go:embed static/index.html
 var staticFS embed.FS
 
+// bufferPool provides reusable byte buffers for JSON encoding to reduce allocations.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
 // WSMessage is the JSON envelope sent over WebSocket to dashboard clients.
 type WSMessage struct {
 	Type      string      `json:"type"`
@@ -29,14 +37,14 @@ type WSMessage struct {
 
 // SnapshotData is the payload inside a WSMessage of type "snapshot".
 type SnapshotData struct {
-	Coordinators []CoordPanel  `json:"coordinators"`
-	Workers      []WorkerPanel `json:"workers"`
-	QueueDepth   int64         `json:"queue_depth"`
-	LiveWorkers  int           `json:"live_workers"`
-	TotalWorkers int           `json:"total_workers"`
-	ThroughputPM float64       `json:"throughput_per_min"`
-	ScrapeAgeSecs float64      `json:"scrape_age_secs"`
-	Stale         bool         `json:"stale"`
+	Coordinators  []CoordPanel  `json:"coordinators"`
+	Workers       []WorkerPanel `json:"workers"`
+	QueueDepth    int64         `json:"queue_depth"`
+	LiveWorkers   int           `json:"live_workers"`
+	TotalWorkers  int           `json:"total_workers"`
+	ThroughputPM  float64       `json:"throughput_per_min"`
+	ScrapeAgeSecs float64       `json:"scrape_age_secs"`
+	Stale         bool          `json:"stale"`
 }
 
 // CoordPanel is the coordinator state sent to the dashboard.
@@ -49,13 +57,14 @@ type CoordPanel struct {
 
 // WorkerPanel is the worker state sent to the dashboard.
 type WorkerPanel struct {
-	WorkerID  string  `json:"worker_id"`
-	Alive     bool    `json:"alive"`
-	Tasks     int64   `json:"tasks_done"`
-	Failed    int64   `json:"tasks_failed"`
-	P50Ms     float64 `json:"p50_ms"`
-	P99Ms     float64 `json:"p99_ms"`
-	Reachable bool    `json:"reachable"`
+	WorkerID     string  `json:"worker_id"`
+	Alive        bool    `json:"alive"`
+	Tasks        int64   `json:"tasks_done"`
+	Failed       int64   `json:"tasks_failed"`
+	P50Ms        float64 `json:"p50_ms"`
+	P99Ms        float64 `json:"p99_ms"`
+	LastSeenSecs float64 `json:"last_seen_secs"`
+	Reachable    bool    `json:"reachable"`
 }
 
 // hub manages WebSocket client connections. The clients map is owned exclusively
@@ -81,8 +90,8 @@ type Server struct {
 // NewServer creates a dashboard Server backed by the provided scraper and metrics.
 func NewServer(s *scraper.Scraper, m *metrics.Metrics) *Server {
 	return &Server{
-		scraper:  s,
-		metrics:  m,
+		scraper: s,
+		metrics: m,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins in dev mode
@@ -150,11 +159,21 @@ func (s *Server) OnSnapshot(snap scraper.ClusterSnapshot) {
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      sd,
 	}
-	data, err := json.Marshal(msg)
-	if err != nil {
+
+	// Use pooled buffer to reduce allocations
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
+
+	if err := json.NewEncoder(buf).Encode(msg); err != nil {
 		log.Printf("[dashboard] failed to marshal snapshot: %v", err)
 		return
 	}
+
+	// Copy buffer data since it will be returned to pool
+	data := make([]byte, buf.Len()-1) // -1 to trim newline from Encode
+	copy(data, buf.Bytes())
+
 	// Non-blocking send — drop if channel full (lag is acceptable, crash is not)
 	select {
 	case s.hub.broadcast <- data:
@@ -178,14 +197,23 @@ func (s *Server) buildSnapshotData(snap scraper.ClusterSnapshot) SnapshotData {
 	workers := make([]WorkerPanel, len(snap.Workers))
 	var currentTasksTotal int64
 	for i, w := range snap.Workers {
+		lastSeenSecs := 0.0
+		if !w.LastSeen.IsZero() {
+			lastSeenSecs = time.Since(w.LastSeen).Seconds()
+			if lastSeenSecs < 0 {
+				lastSeenSecs = 0
+			}
+		}
+
 		workers[i] = WorkerPanel{
-			WorkerID:  w.WorkerID,
-			Alive:     w.Alive,
-			Tasks:     w.TasksProcessed,
-			Failed:    w.TasksFailed,
-			P50Ms:     w.LatencyP50Ms,
-			P99Ms:     w.LatencyP99Ms,
-			Reachable: w.Reachable,
+			WorkerID:     w.WorkerID,
+			Alive:        w.Alive,
+			Tasks:        w.TasksProcessed,
+			Failed:       w.TasksFailed,
+			P50Ms:        w.LatencyP50Ms,
+			P99Ms:        w.LatencyP99Ms,
+			LastSeenSecs: lastSeenSecs,
+			Reachable:    w.Reachable,
 		}
 		currentTasksTotal += w.TasksProcessed
 	}

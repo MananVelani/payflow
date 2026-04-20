@@ -33,10 +33,3 @@ Thumbs.db
 # Logs
 *.log
 
-# Project Specific
-payflow/monitor/monitor
-payflow/chaos/chaos
-payflow/gateway/gateway
-payflow/coordinator/coordinator
-payflow/worker/worker
-payflow/payment-log/payment-log
