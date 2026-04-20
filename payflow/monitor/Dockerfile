@@ -10,7 +10,8 @@ COPY . .
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /monitor .
 
 FROM alpine:3.19 AS final
-RUN apk add --no-cache ca-certificates wget
+RUN apk add --no-cache ca-certificates wget iproute2
+RUN adduser -D -u 1001 monitor
 COPY --from=builder /monitor /monitor
 EXPOSE 3000 9091
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \

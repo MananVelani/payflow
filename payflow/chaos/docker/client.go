@@ -4,18 +4,23 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
-	"time"
 
+	"time"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
+	containerapi "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
+	networkapi "github.com/docker/docker/api/types/network"
+
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // knownContainers is the list of expected PayFlow container names.
@@ -421,4 +426,170 @@ func (c *Client) Close() error {
 		return c.cli.Close()
 	}
 	return nil
+}
+
+func (c *Client) resolveContainer(ctx context.Context, serviceName string) (string, string, error) {
+	byService, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", "com.docker.compose.service="+serviceName),
+		),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("resolving service %s: %w", serviceName, err)
+	}
+
+	if len(byService) > 0 {
+		picked := pickContainer(byService)
+		return picked.ID, firstContainerName(picked), nil
+	}
+
+	byName, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("name", serviceName),
+		),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("resolving container name %s: %w", serviceName, err)
+	}
+
+	if len(byName) == 0 {
+		return "", "", fmt.Errorf("container %s not found", serviceName)
+	}
+
+	picked := pickContainer(byName)
+	return picked.ID, firstContainerName(picked), nil
+}
+
+func pickContainer(list []types.Container) types.Container {
+	for _, ctr := range list {
+		if ctr.State == "running" {
+			return ctr
+		}
+	}
+	return list[0]
+}
+
+func firstContainerName(ctr types.Container) string {
+	if len(ctr.Names) == 0 {
+		if len(ctr.ID) > 12 {
+			return ctr.ID[:12]
+		}
+		return ctr.ID
+	}
+	return strings.TrimPrefix(ctr.Names[0], "/")
+}
+
+func (c *Client) runInContainer(ctx context.Context, containerID string, cmd []string) error {
+	execResp, err := c.cli.ContainerExecCreate(ctx, containerID, types.ExecConfig{
+		User:         "0",
+		Privileged:   true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Cmd:          cmd,
+	})
+	if err != nil {
+		return fmt.Errorf("creating exec in container: %w", err)
+	}
+
+	attach, err := c.cli.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("attaching exec: %w", err)
+	}
+	defer attach.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if _, err := stdcopy.StdCopy(&stdout, &stderr, attach.Reader); err != nil && err != io.EOF {
+		return fmt.Errorf("reading exec output: %w", err)
+	}
+
+	inspect, err := c.cli.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("inspecting exec result: %w", err)
+	}
+
+	if inspect.ExitCode != 0 {
+		out := strings.TrimSpace(stdout.String())
+		errOut := strings.TrimSpace(stderr.String())
+		if errOut != "" {
+			out = errOut
+		}
+		if out == "" {
+			out = "command failed without output"
+		}
+		return fmt.Errorf("exec exit code %d: %s", inspect.ExitCode, out)
+	}
+
+	return nil
+}
+
+func (c *Client) inferPrimaryNetwork(ctx context.Context, containerID string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspecting container networks: %w", err)
+	}
+
+	if info.NetworkSettings == nil || info.NetworkSettings.Networks == nil {
+		return "", fmt.Errorf("container has no network settings")
+	}
+
+	for netName := range info.NetworkSettings.Networks {
+		if strings.Contains(netName, "payflow-net") {
+			return netName, nil
+		}
+	}
+
+	for netName := range info.NetworkSettings.Networks {
+		return netName, nil
+	}
+
+	return "", fmt.Errorf("no networks found for container")
+}
+
+func (c *Client) ensureNetwork(ctx context.Context, networkName string) error {
+	_, err := c.cli.NetworkInspect(ctx, networkName, types.NetworkInspectOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("inspecting network %s: %w", networkName, err)
+	}
+
+	_, err = c.cli.NetworkCreate(ctx, networkName, types.NetworkCreate{
+		CheckDuplicate: true,
+		Driver:         "bridge",
+		Attachable:     true,
+		Labels: map[string]string{
+			"com.payflow.chaos": "true",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("creating network %s: %w", networkName, err)
+	}
+
+	return nil
+}
+
+func isPayflowContainerName(name string) bool {
+	if strings.Contains(name, "coordinator-") {
+		return true
+	}
+	if strings.Contains(name, "worker-") {
+		return true
+	}
+	if strings.Contains(name, "api-gateway") {
+		return true
+	}
+	if strings.Contains(name, "payment-log") {
+		return true
+	}
+	if strings.Contains(name, "monitor") {
+		return true
+	}
+	if strings.Contains(name, "jaeger") {
+		return true
+	}
+	return false
 }

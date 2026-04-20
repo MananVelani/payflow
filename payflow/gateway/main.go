@@ -1,5 +1,3 @@
-// Package main implements a canonical placeholder HTTP server for PayFlow services.
-// Members 1–4 copy this into their service directories and replace with real code in Weeks 2–3.
 package main
 
 import (
@@ -8,131 +6,421 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	// Update this module path to match your go.mod
-	paymentPb "payflow/proto/payment" 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	// OpenTelemetry and Jaeger
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
+
+	pb "payflow/proto/payment"
 )
 
-func main() {
-	port := getEnv("PORT", "8080")
-	metricsPort := getEnv("METRICS_PORT", "2112")
-
-	// Server A: main service endpoints
-	mainMux := http.NewServeMux()
-	mainMux.HandleFunc("/health", handleHealth)
-	mainMux.HandleFunc("/metrics", handleMetricsStub)
-	mainMux.HandleFunc("/v1/payments", handlePaymentStub)
-
-	mainServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mainMux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-
-	grpcClient := paymentPb.NewPaymentGatewayClient(conn)
-
-	metricsServer := &http.Server{
-		Addr:         ":" + metricsPort,
-		Handler:      metricsMux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-
-	// Start both servers concurrently
-	go func() {
-		log.Printf("placeholder service listening on :%s", port)
-		if err := mainServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("main server error: %v", err)
-		}
-	}()
-
-		// 3. Forward request to Coordinator via gRPC [cite: 59]
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		resp, err := grpcClient.SubmitTask(ctx, &paymentPb.SubmitTaskRequest{
-			Epoch:          1, // Dummy epoch for Week 1
-			Amount:         req.Amount,
-			Currency:       req.Currency,
-			MerchantId:     req.MerchantID,
-			IdempotencyKey: req.IdempotencyKey,
-		})
-
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
-			return
-		}
-	}()
-
-	// Graceful shutdown on SIGTERM/SIGINT
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-quit
-	log.Printf("received signal %s, shutting down gracefully...", sig)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := mainServer.Shutdown(ctx); err != nil {
-		log.Printf("main server shutdown error: %v", err)
-	}
-	if err := metricsServer.Shutdown(ctx); err != nil {
-		log.Printf("metrics server shutdown error: %v", err)
-	}
-
-	log.Println("placeholder service stopped")
+// PaymentRequest represents the incoming JSON payload
+type PaymentRequest struct {
+	Amount         float64 `json:"amount"`
+	Currency       string  `json:"currency"`
+	MerchantID     string  `json:"merchant_id"`
+	IdempotencyKey string  `json:"idempotency_key"`
 }
 
-// handleHealth returns a JSON health check response.
-func handleHealth(w http.ResponseWriter, r *http.Request) {
+type Gateway struct {
+	leaderAddr string
+	conn       *grpc.ClientConn
+	client     pb.PaymentGatewayClient
+	mu         sync.Mutex
+}
+
+var gatewayRequestTotal uint64
+
+var coordinatorCandidates = []string{
+	"coordinator-1:50051",
+	"coordinator-2:50052",
+	"coordinator-3:50053",
+}
+
+func initTracer() (*sdktrace.TracerProvider, error) {
+	// A05: C1 Distributed Tracing (Jaeger) using jaeger:14268 based on typical Docker compose layout
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("C1-API-Gateway"),
+		)),
+	)
+
+	otel.SetTracerProvider(tp)
+	// Propagator ensures trace_id is forwarded
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	return tp, nil
+}
+
+func NewGateway(initialLeader string) *Gateway {
+	gw := &Gateway{
+		leaderAddr: initialLeader,
+	}
+	gw.connect(initialLeader)
+	return gw
+}
+
+func (gw *Gateway) connect(addr string) {
+	if gw.conn != nil {
+		gw.conn.Close()
+	}
+	// A05 trace_id propagation via gRPC metadata
+	conn, err := grpc.Dial(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	)
+	if err != nil {
+		log.Printf("Failed to connect to coordinator at %s: %v", addr, err)
+	}
+	gw.conn = conn
+	gw.client = pb.NewPaymentGatewayClient(conn)
+	gw.leaderAddr = addr
+	log.Printf("Gateway connected to leader: %s", addr)
+}
+
+func (gw *Gateway) updateLeader(addr string) {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if gw.leaderAddr != addr {
+		log.Printf("Leader redirect received. Updating leader to: %s", addr)
+		gw.connect(addr)
+	}
+}
+
+func (gw *Gateway) rotateLeader() {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+
+	idx := -1
+	for i, addr := range coordinatorCandidates {
+		if addr == gw.leaderAddr {
+			idx = i
+			break
+		}
+	}
+
+	nextIdx := 0
+	if idx >= 0 {
+		nextIdx = (idx + 1) % len(coordinatorCandidates)
+	}
+
+	next := coordinatorCandidates[nextIdx]
+	log.Printf("Leader unknown, rotating coordinator target to: %s", next)
+	gw.connect(next)
+}
+
+func (gw *Gateway) getClient() pb.PaymentGatewayClient {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	return gw.client
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	resp := map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
-		"service": "placeholder",
-	}
-	json.NewEncoder(w).Encode(resp)
+		"service": "api-gateway",
+	})
 }
 
-// handleMetricsStub returns a minimal metrics stub for the main port.
-func handleMetricsStub(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "# placeholder metrics\n")
-}
-
-// handlePaymentStub returns a stub payment response.
-func handlePaymentStub(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	resp := map[string]string{
-		"txn_id": "stub-001",
-		"status": "queued",
-	}
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handlePrometheusMetrics returns valid Prometheus text format metrics.
-func handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+func handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	total := atomic.LoadUint64(&gatewayRequestTotal)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `# HELP placeholder_up Service is up
-# TYPE placeholder_up gauge
-placeholder_up 1
-`)
+	fmt.Fprintf(w, "# HELP payflow_gateway_requests_total Total HTTP requests handled by the API gateway.\n")
+	fmt.Fprintf(w, "# TYPE payflow_gateway_requests_total counter\n")
+	fmt.Fprintf(w, "payflow_gateway_requests_total %d\n", total)
 }
 
-// getEnv reads an environment variable with a fallback default value.
-func getEnv(key, fallback string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+func main() {
+	tp, err := initTracer()
+	if err != nil {
+		log.Fatal(err)
 	}
-	return fallback
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	tracer := otel.Tracer("payflow/gateway")
+	gw := NewGateway("coordinator-1:50051")
+
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/metrics", handleMetrics)
+
+	http.HandleFunc("/v1/payments", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, "POST /v1/payments", trace.WithAttributes(attribute.String("http.route", "/v1/payments")))
+		defer span.End()
+
+		var req PaymentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			span.RecordError(err)
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+
+		maxRetries := 3
+		var resp *pb.SubmitTaskResponse
+
+		for i := 0; i < maxRetries; i++ {
+			reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			client := gw.getClient()
+			var err error
+			resp, err = client.SubmitTask(reqCtx, &pb.SubmitTaskRequest{
+				Epoch:          1,
+				Amount:         req.Amount,
+				Currency:       req.Currency,
+				MerchantId:     req.MerchantID,
+				IdempotencyKey: req.IdempotencyKey,
+			})
+			cancel()
+
+			if err != nil {
+				span.RecordError(err)
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
+					parts := strings.Split(err.Error(), "|")
+					if len(parts) > 1 {
+						gw.updateLeader(parts[1])
+						continue
+					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
+				}
+				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
+				continue
+			}
+
+			if resp.GetErrorMessage() != "" {
+				errMsg := strings.ToUpper(resp.GetErrorMessage())
+				if strings.Contains(errMsg, "NOT_LEADER") || strings.Contains(strings.ToLower(resp.GetErrorMessage()), "not the leader") {
+					gw.rotateLeader()
+					continue
+				}
+				span.SetAttributes(attribute.String("error.msg", resp.GetErrorMessage()))
+				http.Error(w, fmt.Sprintf("Processing error: %v", resp.GetErrorMessage()), http.StatusInternalServerError)
+				return
+			}
+			break
+		}
+
+		if resp == nil {
+			http.Error(w, "Max retries exceeded", http.StatusServiceUnavailable)
+			return
+		}
+
+		span.SetAttributes(attribute.String("txn_id", resp.GetTxnId()))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"txn_id":   resp.GetTxnId(),
+			"status":   "QUEUED",
+			"trace_id": span.SpanContext().TraceID().String(),
+		})
+	})
+
+	http.HandleFunc("/v1/payments/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, "GET /v1/payments/{id}")
+		defer span.End()
+
+		txnID := strings.TrimPrefix(r.URL.Path, "/v1/payments/")
+		if txnID == "" {
+			http.Error(w, "Missing txn_id", http.StatusBadRequest)
+			return
+		}
+		span.SetAttributes(attribute.String("txn_id", txnID))
+
+		maxRetries := 3
+		var resp *pb.GetStatusResponse
+
+		for i := 0; i < maxRetries; i++ {
+			reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			client := gw.getClient()
+			var err error
+			resp, err = client.GetPaymentStatus(reqCtx, &pb.GetStatusRequest{
+				Epoch: 1,
+				TxnId: txnID,
+			})
+			cancel()
+
+			if err != nil {
+				span.RecordError(err)
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
+					parts := strings.Split(err.Error(), "|")
+					if len(parts) > 1 {
+						gw.updateLeader(parts[1])
+						continue
+					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
+				}
+				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
+				continue
+			}
+			break
+		}
+
+		if resp == nil {
+			http.Error(w, "Max retries exceeded", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"txn_id":   resp.GetTxnId(),
+			"status":   resp.GetStatus(),
+			"trace_id": span.SpanContext().TraceID().String(),
+		})
+	})
+
+	http.HandleFunc("/v1/batch", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&gatewayRequestTotal, 1)
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, "POST /v1/batch")
+		defer span.End()
+
+		var reqs []PaymentRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
+			span.RecordError(err)
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+
+		var pbReqs []*pb.SubmitTaskRequest
+		for _, req := range reqs {
+			pbReqs = append(pbReqs, &pb.SubmitTaskRequest{
+				Epoch:          1,
+				Amount:         req.Amount,
+				Currency:       req.Currency,
+				MerchantId:     req.MerchantID,
+				IdempotencyKey: req.IdempotencyKey,
+			})
+		}
+
+		maxRetries := 3
+		var resp *pb.SubmitBatchResponse
+
+		for i := 0; i < maxRetries; i++ {
+			reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			client := gw.getClient()
+			var err error
+			resp, err = client.SubmitBatch(reqCtx, &pb.SubmitBatchRequest{
+				Epoch: 1,
+				Tasks: pbReqs,
+			})
+			cancel()
+
+			if err != nil {
+				span.RecordError(err)
+				errMsg := strings.ToUpper(err.Error())
+				if strings.Contains(errMsg, "NOT_LEADER") {
+					parts := strings.Split(err.Error(), "|")
+					if len(parts) > 1 {
+						gw.updateLeader(parts[1])
+						continue
+					}
+					gw.rotateLeader()
+					continue
+				}
+				if strings.Contains(strings.ToLower(err.Error()), "not the leader") {
+					gw.rotateLeader()
+					continue
+				}
+				http.Error(w, fmt.Sprintf("Coordinator error: %v", err), http.StatusServiceUnavailable)
+				return
+			}
+
+			if resp.GetLeaderAddress() != "" {
+				gw.updateLeader(resp.GetLeaderAddress())
+				continue
+			}
+			break
+		}
+
+		if resp == nil {
+			http.Error(w, "Max retries exceeded", http.StatusServiceUnavailable)
+			return
+		}
+
+		results := make([]map[string]interface{}, 0)
+		for _, r := range resp.Responses {
+			results = append(results, map[string]interface{}{
+				"txn_id":  r.GetTxnId(),
+				"success": r.GetSuccess(),
+				"error":   r.GetErrorMessage(),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"batch_results": results,
+			"trace_id":      span.SpanContext().TraceID().String(),
+		})
+	})
+
+	log.Println("C1 API Gateway starting on port 8080. Trace exporter configured.")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Failed to start gateway: %v", err)
+	}
 }

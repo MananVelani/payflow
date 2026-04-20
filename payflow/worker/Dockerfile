@@ -1,18 +1,30 @@
-# Placeholder Dockerfile for PayFlow services (Members 1-4)
-# Each member copies this into their service directory and replaces with real code in Weeks 2-3.
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM golang:alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
 
-FROM golang:1.25-alpine AS builder
-WORKDIR /build
-COPY main.go .
-RUN go mod init placeholder && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /placeholder .
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+  -ldflags="-w -s" \
+  -o /worker \
+  ./cmd/worker
 
-FROM alpine:3.19 AS final
-RUN apk add --no-cache ca-certificates wget
-RUN adduser -D -u 1001 app
-COPY --from=builder /placeholder /placeholder
-USER app
-EXPOSE 8080 2112
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
-ENTRYPOINT ["/placeholder"]
+# ── Stage 2: Final Image ──────────────────────────────────────────────────────
+# Using alpine for final image to support health check via wget
+FROM alpine:3.18
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /
+COPY --from=builder /worker /worker
+
+# EXPOSE metrics and gRPC
+EXPOSE 9092 50053
+
+# Health check using metrics endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["wget", "--quiet", "--tries=1", "--spider", "http://localhost:9092/metrics"]
+
+ENTRYPOINT ["/worker"]

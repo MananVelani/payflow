@@ -42,6 +42,7 @@ Examples:
 			if !validContainers[node] {
 				return fmt.Errorf("unknown container %q; valid names: coordinator-1/2/3, worker-1..5, api-gateway, payment-log, monitor", node)
 			}
+			trimmedNodes = append(trimmedNodes, trimmed)
 		}
 
 		logChaos("creating network partition between: %s", nodeList)

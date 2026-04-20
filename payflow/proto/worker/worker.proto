@@ -8,6 +8,8 @@ service WorkerManagement {
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
     rpc PollTasks(PollRequest) returns (stream TaskAssignment);
     rpc ReportResult(TaskResult) returns (ResultAck);
+    rpc RevokeTask(RevokeRequest) returns (RevokeAck);
+    rpc WorkerHeartbeat(stream HeartbeatPing) returns (stream HeartbeatAck);
 }
 
 message RegisterRequest {
@@ -61,4 +63,24 @@ message TaskResult {
 
 message ResultAck {
     bool acknowledged = 1;
+}
+
+message RevokeRequest {
+    string task_id = 1;
+}
+
+message RevokeAck {
+    bool acknowledged = 1;
+}
+
+message HeartbeatPing {
+    string worker_id             = 1;
+    float  load                  = 2;  // active_tasks / max_capacity, 0.0-1.0
+    int64  tasks_processed_count = 3;
+    int64  avg_task_duration_ms  = 4;
+    int64  epoch                 = 5;
+}
+
+message HeartbeatAck {
+    int64 epoch = 1;
 }

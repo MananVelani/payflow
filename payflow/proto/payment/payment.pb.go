@@ -110,6 +110,7 @@ type SubmitTaskResponse struct {
 	//
 	//	*SubmitTaskResponse_Success
 	//	*SubmitTaskResponse_ErrorMessage
+	//	*SubmitTaskResponse_LeaderAddress
 	Result        isSubmitTaskResponse_Result `protobuf_oneof:"result"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -177,6 +178,15 @@ func (x *SubmitTaskResponse) GetErrorMessage() string {
 	return ""
 }
 
+func (x *SubmitTaskResponse) GetLeaderAddress() string {
+	if x != nil {
+		if x, ok := x.Result.(*SubmitTaskResponse_LeaderAddress); ok {
+			return x.LeaderAddress
+		}
+	}
+	return ""
+}
+
 type isSubmitTaskResponse_Result interface {
 	isSubmitTaskResponse_Result()
 }
@@ -189,9 +199,231 @@ type SubmitTaskResponse_ErrorMessage struct {
 	ErrorMessage string `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3,oneof"`
 }
 
+type SubmitTaskResponse_LeaderAddress struct {
+	LeaderAddress string `protobuf:"bytes,4,opt,name=leader_address,json=leaderAddress,proto3,oneof"` // Used in C05: Leader Redirect
+}
+
 func (*SubmitTaskResponse_Success) isSubmitTaskResponse_Result() {}
 
 func (*SubmitTaskResponse_ErrorMessage) isSubmitTaskResponse_Result() {}
+
+func (*SubmitTaskResponse_LeaderAddress) isSubmitTaskResponse_Result() {}
+
+type SubmitBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Epoch         int64                  `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Tasks         []*SubmitTaskRequest   `protobuf:"bytes,2,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitBatchRequest) Reset() {
+	*x = SubmitBatchRequest{}
+	mi := &file_proto_payment_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitBatchRequest) ProtoMessage() {}
+
+func (x *SubmitBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_payment_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitBatchRequest.ProtoReflect.Descriptor instead.
+func (*SubmitBatchRequest) Descriptor() ([]byte, []int) {
+	return file_proto_payment_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *SubmitBatchRequest) GetEpoch() int64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *SubmitBatchRequest) GetTasks() []*SubmitTaskRequest {
+	if x != nil {
+		return x.Tasks
+	}
+	return nil
+}
+
+type SubmitBatchResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Responses     []*SubmitTaskResponse  `protobuf:"bytes,1,rep,name=responses,proto3" json:"responses,omitempty"`
+	LeaderAddress string                 `protobuf:"bytes,2,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitBatchResponse) Reset() {
+	*x = SubmitBatchResponse{}
+	mi := &file_proto_payment_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitBatchResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitBatchResponse) ProtoMessage() {}
+
+func (x *SubmitBatchResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_payment_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitBatchResponse.ProtoReflect.Descriptor instead.
+func (*SubmitBatchResponse) Descriptor() ([]byte, []int) {
+	return file_proto_payment_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *SubmitBatchResponse) GetResponses() []*SubmitTaskResponse {
+	if x != nil {
+		return x.Responses
+	}
+	return nil
+}
+
+func (x *SubmitBatchResponse) GetLeaderAddress() string {
+	if x != nil {
+		return x.LeaderAddress
+	}
+	return ""
+}
+
+type GetStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Epoch         int64                  `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	TxnId         string                 `protobuf:"bytes,2,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetStatusRequest) Reset() {
+	*x = GetStatusRequest{}
+	mi := &file_proto_payment_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetStatusRequest) ProtoMessage() {}
+
+func (x *GetStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_payment_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetStatusRequest) Descriptor() ([]byte, []int) {
+	return file_proto_payment_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *GetStatusRequest) GetEpoch() int64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *GetStatusRequest) GetTxnId() string {
+	if x != nil {
+		return x.TxnId
+	}
+	return ""
+}
+
+type GetStatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxnId         string                 `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	LeaderAddress string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetStatusResponse) Reset() {
+	*x = GetStatusResponse{}
+	mi := &file_proto_payment_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetStatusResponse) ProtoMessage() {}
+
+func (x *GetStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_payment_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetStatusResponse) Descriptor() ([]byte, []int) {
+	return file_proto_payment_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GetStatusResponse) GetTxnId() string {
+	if x != nil {
+		return x.TxnId
+	}
+	return ""
+}
+
+func (x *GetStatusResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *GetStatusResponse) GetLeaderAddress() string {
+	if x != nil {
+		return x.LeaderAddress
+	}
+	return ""
+}
 
 var File_proto_payment_proto protoreflect.FileDescriptor
 
@@ -204,15 +436,31 @@ const file_proto_payment_proto_rawDesc = "" +
 	"\bcurrency\x18\x03 \x01(\tR\bcurrency\x12\x1f\n" +
 	"\vmerchant_id\x18\x04 \x01(\tR\n" +
 	"merchantId\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKeyJ\x04\b\x06\x10\v\"x\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKeyJ\x04\b\x06\x10\v\"\xa1\x01\n" +
 	"\x12SubmitTaskResponse\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\tR\x05txnId\x12\x1a\n" +
 	"\asuccess\x18\x02 \x01(\bH\x00R\asuccess\x12%\n" +
-	"\rerror_message\x18\x03 \x01(\tH\x00R\ferrorMessageB\b\n" +
-	"\x06result2m\n" +
+	"\rerror_message\x18\x03 \x01(\tH\x00R\ferrorMessage\x12'\n" +
+	"\x0eleader_address\x18\x04 \x01(\tH\x00R\rleaderAddressB\b\n" +
+	"\x06result\"g\n" +
+	"\x12SubmitBatchRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x03R\x05epoch\x12;\n" +
+	"\x05tasks\x18\x02 \x03(\v2%.payflow.payment.v1.SubmitTaskRequestR\x05tasks\"\x82\x01\n" +
+	"\x13SubmitBatchResponse\x12D\n" +
+	"\tresponses\x18\x01 \x03(\v2&.payflow.payment.v1.SubmitTaskResponseR\tresponses\x12%\n" +
+	"\x0eleader_address\x18\x02 \x01(\tR\rleaderAddress\"?\n" +
+	"\x10GetStatusRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x03R\x05epoch\x12\x15\n" +
+	"\x06txn_id\x18\x02 \x01(\tR\x05txnId\"i\n" +
+	"\x11GetStatusResponse\x12\x15\n" +
+	"\x06txn_id\x18\x01 \x01(\tR\x05txnId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12%\n" +
+	"\x0eleader_address\x18\x03 \x01(\tR\rleaderAddress2\xae\x02\n" +
 	"\x0ePaymentGateway\x12[\n" +
 	"\n" +
-	"SubmitTask\x12%.payflow.payment.v1.SubmitTaskRequest\x1a&.payflow.payment.v1.SubmitTaskResponseB\x17Z\x15payflow/proto/paymentb\x06proto3"
+	"SubmitTask\x12%.payflow.payment.v1.SubmitTaskRequest\x1a&.payflow.payment.v1.SubmitTaskResponse\x12^\n" +
+	"\vSubmitBatch\x12&.payflow.payment.v1.SubmitBatchRequest\x1a'.payflow.payment.v1.SubmitBatchResponse\x12_\n" +
+	"\x10GetPaymentStatus\x12$.payflow.payment.v1.GetStatusRequest\x1a%.payflow.payment.v1.GetStatusResponseB\x17Z\x15payflow/proto/paymentb\x06proto3"
 
 var (
 	file_proto_payment_proto_rawDescOnce sync.Once
@@ -226,19 +474,29 @@ func file_proto_payment_proto_rawDescGZIP() []byte {
 	return file_proto_payment_proto_rawDescData
 }
 
-var file_proto_payment_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proto_payment_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_proto_payment_proto_goTypes = []any{
-	(*SubmitTaskRequest)(nil),  // 0: payflow.payment.v1.SubmitTaskRequest
-	(*SubmitTaskResponse)(nil), // 1: payflow.payment.v1.SubmitTaskResponse
+	(*SubmitTaskRequest)(nil),   // 0: payflow.payment.v1.SubmitTaskRequest
+	(*SubmitTaskResponse)(nil),  // 1: payflow.payment.v1.SubmitTaskResponse
+	(*SubmitBatchRequest)(nil),  // 2: payflow.payment.v1.SubmitBatchRequest
+	(*SubmitBatchResponse)(nil), // 3: payflow.payment.v1.SubmitBatchResponse
+	(*GetStatusRequest)(nil),    // 4: payflow.payment.v1.GetStatusRequest
+	(*GetStatusResponse)(nil),   // 5: payflow.payment.v1.GetStatusResponse
 }
 var file_proto_payment_proto_depIdxs = []int32{
-	0, // 0: payflow.payment.v1.PaymentGateway.SubmitTask:input_type -> payflow.payment.v1.SubmitTaskRequest
-	1, // 1: payflow.payment.v1.PaymentGateway.SubmitTask:output_type -> payflow.payment.v1.SubmitTaskResponse
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	0, // 0: payflow.payment.v1.SubmitBatchRequest.tasks:type_name -> payflow.payment.v1.SubmitTaskRequest
+	1, // 1: payflow.payment.v1.SubmitBatchResponse.responses:type_name -> payflow.payment.v1.SubmitTaskResponse
+	0, // 2: payflow.payment.v1.PaymentGateway.SubmitTask:input_type -> payflow.payment.v1.SubmitTaskRequest
+	2, // 3: payflow.payment.v1.PaymentGateway.SubmitBatch:input_type -> payflow.payment.v1.SubmitBatchRequest
+	4, // 4: payflow.payment.v1.PaymentGateway.GetPaymentStatus:input_type -> payflow.payment.v1.GetStatusRequest
+	1, // 5: payflow.payment.v1.PaymentGateway.SubmitTask:output_type -> payflow.payment.v1.SubmitTaskResponse
+	3, // 6: payflow.payment.v1.PaymentGateway.SubmitBatch:output_type -> payflow.payment.v1.SubmitBatchResponse
+	5, // 7: payflow.payment.v1.PaymentGateway.GetPaymentStatus:output_type -> payflow.payment.v1.GetStatusResponse
+	5, // [5:8] is the sub-list for method output_type
+	2, // [2:5] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_proto_payment_proto_init() }
@@ -249,6 +507,7 @@ func file_proto_payment_proto_init() {
 	file_proto_payment_proto_msgTypes[1].OneofWrappers = []any{
 		(*SubmitTaskResponse_Success)(nil),
 		(*SubmitTaskResponse_ErrorMessage)(nil),
+		(*SubmitTaskResponse_LeaderAddress)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -256,7 +515,7 @@ func file_proto_payment_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_payment_proto_rawDesc), len(file_proto_payment_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
