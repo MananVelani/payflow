@@ -1,0 +1,65 @@
+name: PayFlow CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.22'
+
+    - name: Build Services
+      run: |
+        cd payflow
+        go build ./gateway/...
+        go build ./coordinator/...
+        go build ./worker/...
+        go build ./payment-log/...
+        go build ./monitor/...
+
+    - name: Run Unit Tests
+      run: |
+        cd payflow
+        go test ./... -v -race
+
+  system-fault-tests:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install Docker Compose
+      run: sudo apt-get update && sudo apt-get install docker-compose -y
+
+    - name: Start PayFlow Cluster
+      run: |
+        cd payflow
+        docker-compose up -d --build
+        sleep 10 # Wait for cluster to stabilize and elect leader
+
+    - name: Run Fault Scenario: Leader Failover (Recovery < 5s)
+      run: |
+        cd payflow
+        echo "Testing Leader Failover..."
+        # In a real environment, this would use the chaos CLI to measure SLA
+        go run ./chaos/main.go kill-coordinator 1
+        sleep 5
+        # Verify system health through monitor API
+        curl -s http://localhost:3000/health | grep -q "status: ok"
+
+    - name: Teardown Cluster
+      if: always()
+      run: |
+        cd payflow
+        docker-compose down -v

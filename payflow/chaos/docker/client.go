@@ -72,7 +72,7 @@ func (c *Client) KillContainer(ctx context.Context, name string) error {
 	}
 
 	// Find container by name (compose project may prefix the name)
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
 		Filters: filters.NewArgs(
 			filters.Arg("name", name),
 			filters.Arg("status", "running"),
@@ -104,7 +104,7 @@ func (c *Client) PauseContainer(ctx context.Context, name string) error {
 		return nil
 	}
 
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
 		Filters: filters.NewArgs(
 			filters.Arg("name", name),
 			filters.Arg("status", "running"),
@@ -135,7 +135,7 @@ func (c *Client) UnpauseContainer(ctx context.Context, name string) error {
 		return nil
 	}
 
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
 		Filters: filters.NewArgs(
 			filters.Arg("name", name),
 			filters.Arg("status", "paused"),
@@ -167,7 +167,7 @@ func (c *Client) AddNetworkDelay(ctx context.Context, containerName string, dela
 		return nil
 	}
 
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("name", containerName)),
 	})
 	if err != nil {
@@ -289,7 +289,7 @@ func (c *Client) findContainerID(ctx context.Context, name string, runningOnly b
 		filterArgs.Add("status", "running")
 	}
 
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{Filters: filterArgs})
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{Filters: filterArgs})
 	if err != nil {
 		return "", fmt.Errorf("listing containers for %q: %w", name, err)
 	}
@@ -315,7 +315,7 @@ func (c *Client) containerIP(ctx context.Context, containerID string) (string, e
 	return ip, nil
 }
 
-func ipFromNetworks(networks map[string]*network.EndpointSettings) string {
+func ipFromNetworks(networks map[string]*networkapi.EndpointSettings) string {
 	if len(networks) == 0 {
 		return ""
 	}
@@ -377,7 +377,7 @@ func (c *Client) ListContainers(ctx context.Context) ([]string, error) {
 		return knownContainers, nil
 	}
 
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
 		Filters: filters.NewArgs(
 			filters.Arg("status", "running"),
 		),
