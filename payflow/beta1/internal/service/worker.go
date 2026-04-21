@@ -3,17 +3,21 @@ package service
 import (
 	"context"
 	"github.com/your-org/payflow/worker/internal/domain"
+	"github.com/your-org/payflow/worker/internal/concurrency"
 )
 
 type WorkerService interface {
 	ExecuteTask(ctx context.Context, task *domain.Task) (*domain.PaymentResult, error)
 	RevokeTask(ctx context.Context, taskID string) error
+	ResetBankBreaker()
+	SetBackpressureMode(mode concurrency.BackpressureMode)
 	Stats() domain.WorkerStats
 }
 
 type BankClient interface {
 	// idempotency_key MUST be identical across all retry attempts — never generate a new one per retry
 	Charge(ctx context.Context, idempotencyKey string, amount float64, currency string, merchantID string) (txnRef string, err error)
+	ResetBreaker()
 }
 
 type LogServiceClient interface {

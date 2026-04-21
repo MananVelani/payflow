@@ -11,8 +11,8 @@ import (
 
 	"github.com/your-org/payflow/worker/internal/metrics"
 	"github.com/your-org/payflow/worker/internal/observability"
+	"github.com/your-org/payflow/worker/internal/resilience"
 
-	retry "github.com/avast/retry-go/v4"
 	"github.com/sony/gobreaker"
 	"go.uber.org/zap"
 )
@@ -52,7 +52,6 @@ type ProductionMockBankClient struct {
 	metrics *observability.Metrics
 }
 
-
 func NewProductionMockBankClient(cfg MockBankClientConfig, logger *zap.Logger, metrics *observability.Metrics) *ProductionMockBankClient {
 
 	cbSettings := gobreaker.Settings{
@@ -83,13 +82,23 @@ func NewProductionMockBankClient(cfg MockBankClientConfig, logger *zap.Logger, m
 	}
 }
 
-
 // Charge executes the bank charge with retry and circuit breaker.
 // CRITICAL: idempotencyKey must be IDENTICAL across all retry attempts.
 func (c *ProductionMockBankClient) Charge(ctx context.Context, idempotencyKey string, amount float64, currency string, merchantID string) (string, error) {
 	var txnRef string
-	err := retry.Do(
+	attempt := 0
+	// NEW: Use internal resilience utility instead of 3rd party
+	err := resilience.ExecuteWithRetry(
+		ctx,
 		func() error {
+			if attempt > 0 {
+				metrics.BankRetriesTotal.Inc()
+				c.logger.Info("retrying bank charge",
+					zap.Int("attempt", attempt+1),
+					zap.String("idempotency_key", idempotencyKey),
+				)
+			}
+			attempt++
 			ref, err := c.chargeViaBreaker(ctx, idempotencyKey, amount, currency, merchantID)
 			if err != nil {
 				c.logger.Warn("bank charge attempt failed",
@@ -101,19 +110,9 @@ func (c *ProductionMockBankClient) Charge(ctx context.Context, idempotencyKey st
 			txnRef = ref
 			return nil
 		},
-		retry.Attempts(c.cfg.MaxAttempts),
-		retry.DelayType(retry.BackOffDelay),
-		retry.Delay(time.Duration(c.cfg.BaseDelayMS)*time.Millisecond),
-		retry.MaxDelay(4*time.Duration(c.cfg.BaseDelayMS)*time.Millisecond),
-		retry.Context(ctx),
-		retry.OnRetry(func(n uint, err error) {
-			metrics.BankRetriesTotal.Inc()
-			c.logger.Info("retrying bank charge",
-				zap.Uint("attempt", n+1),
-				zap.String("idempotency_key", idempotencyKey),
-				zap.Error(err),
-			)
-		}),
+		int(c.cfg.MaxAttempts),
+		time.Duration(c.cfg.BaseDelayMS)*time.Millisecond,
+		30*time.Second, // Global safe max delay cap
 	)
 	if err != nil {
 		return "", fmt.Errorf("bank charge failed after %d attempts: %w", c.cfg.MaxAttempts, err)
@@ -140,7 +139,6 @@ func (c *ProductionMockBankClient) doHTTPCharge(ctx context.Context, idempotency
 		status := "error"
 		c.metrics.RecordBankRequestDuration(status, float64(time.Since(start).Milliseconds()))
 	}()
-
 
 	// Simulate configurable latency (50–500ms per spec)
 	latencyRange := c.cfg.LatencyMaxMS - c.cfg.LatencyMinMS
@@ -193,4 +191,28 @@ func (c *ProductionMockBankClient) doHTTPCharge(ctx context.Context, idempotency
 		zap.String("bank_txn_ref", bankResp.TxnRef),
 	)
 	return bankResp.TxnRef, nil
+}
+
+func (c *ProductionMockBankClient) ResetBreaker() {
+	c.logger.Info("manually resetting bank circuit breaker")
+	cbSettings := gobreaker.Settings{
+		Name:        "mock-bank",
+		MaxRequests: c.cfg.CBMaxRequests,
+		Interval:    c.cfg.CBInterval,
+		Timeout:     c.cfg.CBTimeout,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			if counts.Requests < uint32(c.cfg.CBMinRequests) {
+				return false
+			}
+			return float64(counts.TotalFailures)/float64(counts.Requests) >= 0.6
+		},
+		OnStateChange: func(name string, from, to gobreaker.State) {
+			c.logger.Warn("circuit breaker state changed",
+				zap.String("breaker", name),
+				zap.String("from", from.String()),
+				zap.String("to", to.String()),
+			)
+		},
+	}
+	c.breaker = gobreaker.NewCircuitBreaker(cbSettings)
 }

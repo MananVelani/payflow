@@ -2,10 +2,11 @@ package concurrency
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +34,7 @@ func TestTaskSemaphore_OrphanedLeaseRecovery(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger, _ := zap.NewDevelopment()
 	// max=5, 3 orphaned leases
 	sem := NewTaskSemaphore(5, store, 60*time.Second, nil, nil, logger)
 
@@ -62,7 +63,7 @@ func TestTaskSemaphore_LeaseLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger, _ := zap.NewDevelopment()
 	sem := NewTaskSemaphore(5, store, 1*time.Second, nil, nil, logger)
 
 	ctx := context.Background()

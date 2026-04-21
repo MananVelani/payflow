@@ -32,3 +32,23 @@ go.work
 data/
 /var/data/c3/outbox
 /outbox/
+config/
+
+# ── Presentation & documentation (not needed in team repo) ──
+presentation.md
+demo.md
+ARCHITECTURE.md
+NARRATIVE_ARCHITECTURE.md
+DATA_FLOW.md
+
+# ── Documentation directories ──
+docs/
+
+# ── Demo & debug tooling (not production code) ──
+demos/
+cmd/demo-mock/
+cmd/flood-fast/
+
+# ── Pre-built debug binaries ──
+grpcurl.exe
+demo-mock.exe

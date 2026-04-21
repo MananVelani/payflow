@@ -3,6 +3,7 @@ package resilience
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sony/gobreaker"
@@ -11,18 +12,18 @@ import (
 	apperrors "github.com/your-org/payflow/worker/internal/errors"
 )
 
-// BankCircuitBreaker wraps sony/gobreaker to protect the bank API.
-// It opens when the failure rate exceeds 50% over a 10s interval.
 type BankCircuitBreaker struct {
-	cb *gobreaker.CircuitBreaker
+	cb       *gobreaker.CircuitBreaker
+	settings gobreaker.Settings
+	mu       sync.Mutex
 }
 
 func NewBankCircuitBreaker(maxRequests uint32, timeout time.Duration, threshold float64, logger *zap.Logger) *BankCircuitBreaker {
 	settings := gobreaker.Settings{
 		Name:        "BankAPI",
-		MaxRequests: maxRequests,      // allow few probes in half-open state
-		Interval:    10 * time.Second, // clear counts every 10s
-		Timeout:     timeout,          // stay open for 30s (default) before half-open
+		MaxRequests: maxRequests,
+		Interval:    10 * time.Second,
+		Timeout:     timeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
 			return counts.Requests >= 3 && failureRatio >= threshold
@@ -37,8 +38,15 @@ func NewBankCircuitBreaker(maxRequests uint32, timeout time.Duration, threshold 
 	}
 
 	return &BankCircuitBreaker{
-		cb: gobreaker.NewCircuitBreaker(settings),
+		cb:       gobreaker.NewCircuitBreaker(settings),
+		settings: settings,
 	}
+}
+
+func (b *BankCircuitBreaker) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cb = gobreaker.NewCircuitBreaker(b.settings)
 }
 
 // Execute wraps an operation with circuit breaker protection.

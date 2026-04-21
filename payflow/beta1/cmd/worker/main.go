@@ -236,7 +236,7 @@ func run() error {
 		cfg.MaxTaskDuration,
 		obsMetrics.WorkerSaturation,
 		obsMetrics.OrphanedLeaseCount,
-		slogLogger,
+		log,
 	)
 
 	registry := concurrency.NewTaskRegistry()
@@ -298,10 +298,12 @@ func run() error {
 			return health.RedisHealthCheck(rootCtx, cfg.ReservationRedisURL)
 		}
 		return nil
-	})
+	}, workerSvc)
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", healthH.Healthz)
 	healthMux.HandleFunc("/readyz", healthH.Readyz)
+	healthMux.HandleFunc("/demo/reset-breaker", healthH.HandleResetBreaker)
+	healthMux.HandleFunc("/demo/backpressure", healthH.HandleSetBackpressureMode)
 	healthServer := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.HealthPort),
 		Handler: healthMux,
@@ -345,6 +347,13 @@ func run() error {
 	
 	// Run the heartbeat loop with infinite retry
 	go stream.RegisterWithRetry(ctx, "heartbeat", registerFn, cfg.ConnectRetryDelay, log)
+
+	// --- DEMO ADDITION: Task Polling ---
+	poller := grpctransport.NewTaskPoller(workerID, conn, workerSvc, log)
+	pollFn := func(sCtx context.Context) error {
+		return poller.Run(sCtx)
+	}
+	go stream.RegisterWithRetry(ctx, "poller", pollFn, cfg.ConnectRetryDelay, log)
 
 	// --- WEEK 2 ADDITION: Outbox relay ---
 	outboxBuf.Start(ctx)

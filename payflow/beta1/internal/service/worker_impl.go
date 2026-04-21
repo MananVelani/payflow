@@ -444,3 +444,14 @@ func (w *WorkerServiceImpl) AcquireSemaphore(ctx context.Context) error {
 func (w *WorkerServiceImpl) ReleaseSemaphore() {
 	w.sem.Release()
 }
+
+func (w *WorkerServiceImpl) ResetBankBreaker() {
+	w.logger.Warn(context.Background(), "manual reset of bank circuit breaker triggered")
+	w.circuitBreaker.Reset()
+	w.bankClient.ResetBreaker()
+}
+
+func (w *WorkerServiceImpl) SetBackpressureMode(mode concurrency.BackpressureMode) {
+	w.logger.Warn(context.Background(), "backpressure mode changed", zap.Int32("mode", int32(mode)))
+	w.sem.SetMode(mode)
+}
