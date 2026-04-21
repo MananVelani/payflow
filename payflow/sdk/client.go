@@ -108,7 +108,7 @@ func (c *Client) SubmitPayment(ctx context.Context, reqData PaymentRequest) (*Pa
 	url := fmt.Sprintf("%s/v1/payments", c.baseURL)
 	jsonData, _ := json.Marshal(reqData)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (c *Client) SubmitBatch(ctx context.Context, reqs []PaymentRequest) (*Batch
 	url := fmt.Sprintf("%s/v1/batch", c.baseURL)
 	jsonData, _ := json.Marshal(reqs)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, err
 	}

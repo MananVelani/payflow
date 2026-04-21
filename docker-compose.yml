@@ -9,7 +9,10 @@
 
 x-coordinator-base: &coordinator-base
   build:
-    context: ./payflow/coordinator
+    context: ./payflow
+    dockerfile: coordinator/Dockerfile
+  cap_add:
+    - NET_ADMIN
   deploy:
     resources:
       limits:
@@ -30,6 +33,9 @@ x-coordinator-base: &coordinator-base
 x-worker-base: &worker-base
   build:
     context: ./payflow/worker
+    dockerfile: Dockerfile
+  cap_add:
+    - NET_ADMIN
   deploy:
     resources:
       limits:
@@ -54,12 +60,15 @@ x-worker-base: &worker-base
 
 x-worker-env: &worker-env
   METRICS_PORT: "2112"
-  COORDINATOR_ADDRS: "coordinator-1:50051,coordinator-2:50052,coordinator-3:50053"
+  COORDINATOR_ADDR: "coordinator-1:50051"
+  LOG_SERVICE_ADDR: "payment-log:50054"
   HEARTBEAT_INTERVAL: "2s"
-  BANK_API_URL: "http://mock-bank:9999"
-  BANK_API_LATENCY_MIN_MS: "50"
-  BANK_API_LATENCY_MAX_MS: "500"
-  BANK_FAILURE_RATE: "0.10"
+  BANK_API_ADDR: "http://mock-bank:9999"
+  BANK_LATENCY_MIN_MS: "50"
+  BANK_LATENCY_MAX_MS: "500"
+  BANK_FAIL_RATE: "0.10"
+  WORKER_TOKEN: "secret-token"
+  OUTBOX_DB_PATH: "/tmp/outbox"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
 
 services:
@@ -68,7 +77,10 @@ services:
   # ─────────────────────────────────────────────────────────
   api-gateway:
     build:
-      context: ./payflow/gateway
+      context: ./payflow
+      dockerfile: gateway/Dockerfile
+    cap_add:
+      - NET_ADMIN
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -107,6 +119,7 @@ services:
   # ─────────────────────────────────────────────────────────
   coordinator-1:
     <<: *coordinator-base
+    command: ["--id=coordinator-1", "--port=:50051"]
     ports:
       - "50051:50051"
       - "2112:2112"
@@ -129,6 +142,7 @@ services:
 
   coordinator-2:
     <<: *coordinator-base
+    command: ["--id=coordinator-2", "--port=:50052"]
     ports:
       - "50052:50052"
       - "2153:2112"
@@ -151,6 +165,7 @@ services:
 
   coordinator-3:
     <<: *coordinator-base
+    command: ["--id=coordinator-3", "--port=:50053"]
     ports:
       - "50053:50053"
       - "2154:2112"
@@ -179,7 +194,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "1"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-1"
 
   worker-2:
@@ -187,7 +202,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "2"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-2"
 
   worker-3:
@@ -195,7 +210,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "3"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-3"
 
   worker-4:
@@ -203,7 +218,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "4"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-4"
 
   worker-5:
@@ -211,7 +226,7 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: "5"
-      PORT: "2112"
+      PORT: "8080"
       OTEL_SERVICE_NAME: "worker-5"
 
   # ─────────────────────────────────────────────────────────
@@ -219,7 +234,10 @@ services:
   # ─────────────────────────────────────────────────────────
   payment-log:
     build:
-      context: ./payflow/payment-log
+      context: ./payflow
+      dockerfile: payment-log/Dockerfile
+    cap_add:
+      - NET_ADMIN
     ports:
       - "50054:50054"
       - "2113:2113"
@@ -234,7 +252,7 @@ services:
     volumes:
       - payflow-bolt:/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:2113/health"]
+      test: ["CMD-SHELL", "nc -z localhost 50054 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -254,6 +272,8 @@ services:
   monitor:
     build:
       context: ./payflow/monitor
+    cap_add:
+      - NET_ADMIN
     ports:
       - "3000:3000"
       - "9091:9091"
@@ -261,6 +281,11 @@ services:
       HTTP_PORT: "3000"
       PROMETHEUS_PORT: "9091"
       SCRAPE_INTERVAL: "15s"
+      SCALING_ENABLED: "true"
+      SCALING_QUEUE_THRESHOLD: "50"
+      SCALING_MAX_WORKERS: "10"
+      SCALING_COOLDOWN: "30s"
+      SCALING_TEMPLATE_WORKER: "worker-1"
       SCRAPE_TARGETS: >-
         http://api-gateway:8080/metrics,
         http://coordinator-1:2112/metrics,
@@ -274,6 +299,8 @@ services:
         http://worker-5:2112/metrics
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       OTEL_SERVICE_NAME: "monitor"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 10s
@@ -288,6 +315,34 @@ services:
         limits:
           cpus: "0.5"
           memory: "256M"
+    restart: unless-stopped
+    networks:
+      - payflow-net
+
+  # ─────────────────────────────────────────────────────────
+  # Supporting: Mock Bank API (simulates external payment gateway)
+  # Uses placeholder service - workers call /v1/payments endpoint
+  # ─────────────────────────────────────────────────────────
+  mock-bank:
+    build:
+      context: ./payflow/placeholder
+      dockerfile: Dockerfile
+    ports:
+      - "9999:9999"
+    environment:
+      PORT: "9999"
+      METRICS_PORT: "2113"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9999/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "64M"
     restart: unless-stopped
     networks:
       - payflow-net

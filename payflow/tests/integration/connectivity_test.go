@@ -2,6 +2,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -31,19 +32,30 @@ func TestAllServicesHealthy(t *testing.T) {
 }
 
 // TestMonitorWebSocketConnects verifies that the Monitor WebSocket endpoint
-// accepts connections and sends heartbeat messages containing the expected payload.
+// accepts connections and sends dashboard messages (snapshot or ping).
 func TestMonitorWebSocketConnects(t *testing.T) {
 	conn := helpers.ConnectWebSocket(t, MonitorWsURL, 30*time.Second)
 	defer conn.Close()
 
-	// Wait for a heartbeat message (broadcast every 5s)
-	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	_, msg, err := conn.ReadMessage()
-	assert.NoError(t, err, "should receive a WebSocket message")
+	// Dashboard emits either "snapshot" (on scrape) or "ping" (every 5s).
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	for {
+		_, msg, err := conn.ReadMessage()
+		assert.NoError(t, err, "should receive a WebSocket message")
 
-	msgStr := string(msg)
-	assert.Contains(t, msgStr, `"type":"heartbeat"`, "message should be a heartbeat")
-	t.Logf("Received WebSocket message: %s", msgStr)
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(msg, &envelope); err != nil {
+			t.Logf("Skipping unparseable WebSocket frame: %s", string(msg))
+			continue
+		}
+
+		if envelope.Type == "snapshot" || envelope.Type == "ping" {
+			t.Logf("Received WebSocket message type=%s", envelope.Type)
+			return
+		}
+	}
 }
 
 // TestPrometheusMetricsExposed verifies that the C5 Prometheus /metrics endpoint
@@ -83,6 +95,7 @@ func TestPayflowNetworkConnectivity(t *testing.T) {
 		{"localhost", "50054", "payment-log gRPC"},
 		{"localhost", "8080", "api-gateway HTTP"},
 		{"localhost", "3000", "monitor HTTP"},
+		{"localhost", "9999", "mock-bank HTTP"},
 	}
 
 	failCount := 0

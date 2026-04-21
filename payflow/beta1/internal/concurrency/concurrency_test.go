@@ -2,16 +2,16 @@ package concurrency_test
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/your-org/payflow/worker/internal/concurrency"
 )
 
 func TestSemaphore_AcquireRelease(t *testing.T) {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := zap.NewNop()
 	sem := concurrency.NewTaskSemaphore(2, nil, 60*time.Second, nil, nil, logger)
 	ctx := context.Background()
 

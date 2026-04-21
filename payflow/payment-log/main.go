@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net"
 
@@ -17,22 +18,32 @@ type LogServer struct {
 	store *Store
 }
 
+// -------------------- AppendEntry --------------------
+
 func (s *LogServer) AppendEntry(ctx context.Context, req *pb.LogEntry) (*pb.AppendResponse, error) {
+	log.Println("[AppendEntry] Saving txn:", req.TxnId)
 
-	log.Println("Saving txn:", req.TxnId)
-
-	// Save to DB
-	s.store.Save(req.TxnId, req)
+	// Save transaction log
+	seq := s.store.Save(req.TxnId, req)
 
 	return &pb.AppendResponse{
-		LogIndex: 1,
+		LogIndex: int64(seq), // Real auto-incremented BoltDB index
 		Success:  true,
 	}, nil
 }
 
+// -------------------- Idempotency Check --------------------
+
 func (s *LogServer) CheckIdempotency(ctx context.Context, req *pb.IdempotencyRequest) (*pb.IdempotencyResponse, error) {
+	log.Println("[CheckIdempotency] Key:", req.IdempotencyKey)
 
 	exists, txnID, success := s.store.CheckIdempotency(req.IdempotencyKey)
+
+	if exists {
+		log.Println("[CheckIdempotency] FOUND -> txn:", txnID)
+	} else {
+		log.Println("[CheckIdempotency] NOT FOUND")
+	}
 
 	return &pb.IdempotencyResponse{
 		Exists:  exists,
@@ -41,7 +52,10 @@ func (s *LogServer) CheckIdempotency(ctx context.Context, req *pb.IdempotencyReq
 	}, nil
 }
 
+// -------------------- Write Result --------------------
+
 func (s *LogServer) WriteResult(ctx context.Context, req *pb.WriteResultRequest) (*pb.WriteResultAck, error) {
+	log.Println("[WriteResult] txn:", req.TxnId, "success:", req.Success)
 
 	s.store.WriteResult(req.IdempotencyKey, req.TxnId, req.Success)
 
@@ -50,24 +64,66 @@ func (s *LogServer) WriteResult(ctx context.Context, req *pb.WriteResultRequest)
 	}, nil
 }
 
-func main() {
-	// ✅ FIX: move here
-	store := NewStore()
+// -------------------- Get All Pending --------------------
+func (s *LogServer) GetAllPending(req *pb.PendingRequest, stream pb.PaymentLogService_GetAllPendingServer) error {
 
-	lis, err := net.Listen("tcp", ":50054")
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+	log.Println("[GetAllPending] Epoch:", req.Epoch)
+
+	results := s.store.GetAllPending(req.Epoch)
+
+	for _, r := range results {
+		// Convert map → LogEntry
+		data, _ := json.Marshal(r)
+
+		var entry pb.LogEntry
+		json.Unmarshal(data, &entry)
+
+		if err := stream.Send(&entry); err != nil {
+			return err
+		}
 	}
 
+	return nil
+}
+
+func (s *LogServer) GetEpoch(ctx context.Context, req *pb.EmptyRequest) (*pb.EpochResponse, error) {
+	epoch := s.store.GetEpoch()
+	log.Printf("[GetEpoch] Returned Epoch: %d", epoch)
+	return &pb.EpochResponse{Epoch: epoch}, nil
+}
+
+func (s *LogServer) SaveEpoch(ctx context.Context, req *pb.EpochRequest) (*pb.WriteResultAck, error) {
+	s.store.SaveEpoch(req.Epoch)
+	log.Printf("[SaveEpoch] Persisted Epoch: %d", req.Epoch)
+	return &pb.WriteResultAck{Acknowledged: true}, nil
+}
+
+// -------------------- Main --------------------
+
+func main() {
+	log.Println("Starting C4 Payment Log Service...")
+
+	// Initialize storage
+	store := NewStore()
+
+	// Start listener
+	lis, err := net.Listen("tcp", ":50054")
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	// Create gRPC server
 	grpcServer := grpc.NewServer()
 
+	// Register service
 	pb.RegisterPaymentLogServiceServer(grpcServer, &LogServer{
 		store: store,
 	})
 
 	log.Println("C4 Payment Log running on :50054")
 
+	// Start server
 	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+		log.Fatalf("Failed to serve: %v", err)
 	}
 }

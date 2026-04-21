@@ -4,11 +4,24 @@
 package docker
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"strings"
+
+	"time"
+
+	"github.com/docker/docker/api/types"
+	containerapi "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	networkapi "github.com/docker/docker/api/types/network"
 
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // knownContainers is the list of expected PayFlow container names.
@@ -52,44 +65,360 @@ func New(composeFile string, dryRun bool) (*Client, error) {
 }
 
 // KillContainer stops a container by name, simulating a crash.
-// WEEK3: implement actual docker kill via c.cli.ContainerKill
+// Uses Docker's SIGKILL to immediately terminate the container process.
 func (c *Client) KillContainer(ctx context.Context, name string) error {
 	if c.dryRun {
 		log.Printf("[DRY-RUN] Would kill container: %s", name)
 		return nil
 	}
-	return fmt.Errorf("WEEK3: KillContainer not yet implemented for container %s", name)
+
+	// Find container by name (compose project may prefix the name)
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("name", name),
+			filters.Arg("status", "running"),
+		),
+	})
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("no running container found matching name %q", name)
+	}
+
+	// Kill the first matching container
+	containerID := containers[0].ID
+	log.Printf("Killing container %s (ID: %.12s)", name, containerID)
+
+	if err := c.cli.ContainerKill(ctx, containerID, "SIGKILL"); err != nil {
+		return fmt.Errorf("killing container %s: %w", name, err)
+	}
+
+	return nil
 }
 
 // PauseContainer freezes a container, simulating a process hang or GC pause.
-// WEEK3: implement via c.cli.ContainerPause
 func (c *Client) PauseContainer(ctx context.Context, name string) error {
 	if c.dryRun {
 		log.Printf("[DRY-RUN] Would pause container: %s", name)
 		return nil
 	}
-	return fmt.Errorf("WEEK3: PauseContainer not yet implemented for container %s", name)
+
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("name", name),
+			filters.Arg("status", "running"),
+		),
+	})
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("no running container found matching name %q", name)
+	}
+
+	containerID := containers[0].ID
+	log.Printf("Pausing container %s (ID: %.12s)", name, containerID)
+
+	if err := c.cli.ContainerPause(ctx, containerID); err != nil {
+		return fmt.Errorf("pausing container %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// UnpauseContainer resumes a paused container.
+func (c *Client) UnpauseContainer(ctx context.Context, name string) error {
+	if c.dryRun {
+		log.Printf("[DRY-RUN] Would unpause container: %s", name)
+		return nil
+	}
+
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("name", name),
+			filters.Arg("status", "paused"),
+		),
+	})
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("no paused container found matching name %q", name)
+	}
+
+	containerID := containers[0].ID
+	log.Printf("Unpausing container %s (ID: %.12s)", name, containerID)
+
+	if err := c.cli.ContainerUnpause(ctx, containerID); err != nil {
+		return fmt.Errorf("unpausing container %s: %w", name, err)
+	}
+
+	return nil
 }
 
 // AddNetworkDelay injects artificial latency into a container's network stack.
-// WEEK3: implement via docker exec tc netem
+// Uses tc qdisc netem to add delay. Set delayMs=0 to remove delay.
 func (c *Client) AddNetworkDelay(ctx context.Context, containerName string, delayMs int) error {
 	if c.dryRun {
 		log.Printf("[DRY-RUN] Would add %dms delay to: %s", delayMs, containerName)
 		return nil
 	}
-	return fmt.Errorf("WEEK3: AddNetworkDelay not yet implemented for container %s", containerName)
+
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("name", containerName)),
+	})
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("no container found matching name %q", containerName)
+	}
+
+	containerID := containers[0].ID
+
+	// Build tc command
+	var cmd []string
+	if delayMs == 0 {
+		// Remove existing qdisc
+		cmd = []string{"tc", "qdisc", "del", "dev", "eth0", "root"}
+	} else {
+		// Add delay using netem
+		cmd = []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", fmt.Sprintf("%dms", delayMs)}
+	}
+
+	// Execute command inside container
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		AttachStderr: true,
+		AttachStdout: true,
+	}
+
+	execID, err := c.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("creating exec: %w", err)
+	}
+
+	if err := c.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{}); err != nil {
+		// Ignore "qdisc not found" errors when removing (no delay was set)
+		if delayMs == 0 {
+			log.Printf("Note: no existing delay to remove from %s", containerName)
+			return nil
+		}
+		return fmt.Errorf("executing tc command: %w", err)
+	}
+
+	return nil
 }
 
-// ListContainers returns the names of all known PayFlow containers.
-// WEEK3: implement via c.cli.ContainerList with label filtering
+// PartitionNodes creates a symmetric network partition between the provided nodes.
+// It adds INPUT/OUTPUT iptables DROP rules for each pair of container IPs.
+func (c *Client) PartitionNodes(ctx context.Context, nodeNames []string) error {
+	if len(nodeNames) < 2 {
+		return fmt.Errorf("need at least 2 nodes to create a partition")
+	}
+
+	if c.dryRun {
+		log.Printf("[DRY-RUN] Would partition nodes: %s", strings.Join(nodeNames, ","))
+		return nil
+	}
+
+	type nodeMeta struct {
+		name string
+		id   string
+		ip   string
+	}
+
+	metas := make([]nodeMeta, 0, len(nodeNames))
+	for _, name := range nodeNames {
+		containerID, err := c.findContainerID(ctx, name, true)
+		if err != nil {
+			return err
+		}
+
+		ip, err := c.containerIP(ctx, containerID)
+		if err != nil {
+			return fmt.Errorf("resolving IP for %s: %w", name, err)
+		}
+
+		metas = append(metas, nodeMeta{name: name, id: containerID, ip: ip})
+	}
+
+	var errs []error
+	for i := 0; i < len(metas); i++ {
+		for j := i + 1; j < len(metas); j++ {
+			a := metas[i]
+			b := metas[j]
+
+			if err := c.blockOneWay(ctx, a.id, b.ip); err != nil {
+				errs = append(errs, fmt.Errorf("blocking %s -> %s: %w", a.name, b.name, err))
+			}
+			if err := c.blockOneWay(ctx, b.id, a.ip); err != nil {
+				errs = append(errs, fmt.Errorf("blocking %s -> %s: %w", b.name, a.name, err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+func (c *Client) blockOneWay(ctx context.Context, containerID, peerIP string) error {
+	inputRule := fmt.Sprintf("iptables -C INPUT -s %s -j DROP || iptables -A INPUT -s %s -j DROP", peerIP, peerIP)
+	outputRule := fmt.Sprintf("iptables -C OUTPUT -d %s -j DROP || iptables -A OUTPUT -d %s -j DROP", peerIP, peerIP)
+
+	if err := c.execInContainer(ctx, containerID, []string{"/bin/sh", "-c", inputRule}); err != nil {
+		return err
+	}
+	if err := c.execInContainer(ctx, containerID, []string{"/bin/sh", "-c", outputRule}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) findContainerID(ctx context.Context, name string, runningOnly bool) (string, error) {
+	filterArgs := filters.NewArgs(filters.Arg("name", name))
+	if runningOnly {
+		filterArgs.Add("status", "running")
+	}
+
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{Filters: filterArgs})
+	if err != nil {
+		return "", fmt.Errorf("listing containers for %q: %w", name, err)
+	}
+
+	if len(containers) == 0 {
+		return "", fmt.Errorf("no running container found matching name %q", name)
+	}
+
+	return containers[0].ID, nil
+}
+
+func (c *Client) containerIP(ctx context.Context, containerID string) (string, error) {
+	inspect, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspecting container %.12s: %w", containerID, err)
+	}
+
+	ip := ipFromNetworks(inspect.NetworkSettings.Networks)
+	if ip == "" {
+		return "", fmt.Errorf("container %.12s has no network IP", containerID)
+	}
+
+	return ip, nil
+}
+
+func ipFromNetworks(networks map[string]*networkapi.EndpointSettings) string {
+	if len(networks) == 0 {
+		return ""
+	}
+
+	if ep, ok := networks["payflow-net"]; ok && ep != nil && ep.IPAddress != "" {
+		return ep.IPAddress
+	}
+
+	for _, ep := range networks {
+		if ep != nil && ep.IPAddress != "" {
+			return ep.IPAddress
+		}
+	}
+
+	return ""
+}
+
+func (c *Client) execInContainer(ctx context.Context, containerID string, cmd []string) error {
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		AttachStderr: false,
+		AttachStdout: false,
+	}
+
+	execID, err := c.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("creating exec %q: %w", strings.Join(cmd, " "), err)
+	}
+
+	if err := c.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{}); err != nil {
+		return fmt.Errorf("starting exec %q: %w", strings.Join(cmd, " "), err)
+	}
+
+	for {
+		execInspect, err := c.cli.ContainerExecInspect(ctx, execID.ID)
+		if err != nil {
+			return fmt.Errorf("inspecting exec %q: %w", strings.Join(cmd, " "), err)
+		}
+
+		if !execInspect.Running {
+			if execInspect.ExitCode != 0 {
+				return fmt.Errorf("command %q failed with exit code %d", strings.Join(cmd, " "), execInspect.ExitCode)
+			}
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for exec %q: %w", strings.Join(cmd, " "), ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// ListContainers returns the names of all running PayFlow containers.
 func (c *Client) ListContainers(ctx context.Context) ([]string, error) {
 	if c.dryRun {
 		log.Println("[DRY-RUN] Listing expected PayFlow containers")
 		return knownContainers, nil
 	}
-	// Return hardcoded list for dry-run output in Week 1
-	return knownContainers, nil
+
+	containers, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("status", "running"),
+		),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+
+	// Filter for PayFlow containers by matching known names
+	var names []string
+	knownSet := make(map[string]bool, len(knownContainers))
+	for _, name := range knownContainers {
+		knownSet[name] = true
+	}
+
+	for _, c := range containers {
+		for _, name := range c.Names {
+			// Docker prefixes names with "/"
+			cleanName := name
+			if len(name) > 0 && name[0] == '/' {
+				cleanName = name[1:]
+			}
+			// Check if it matches any known container or contains the name
+			for known := range knownSet {
+				if cleanName == known || containsName(cleanName, known) {
+					names = append(names, cleanName)
+					break
+				}
+			}
+		}
+	}
+
+	return names, nil
+}
+
+// containsName checks if fullName contains the expectedName (handles compose prefixes).
+func containsName(fullName, expectedName string) bool {
+	// Docker Compose may prefix with project name like "payflow-coordinator-1"
+	return len(fullName) >= len(expectedName) &&
+		fullName[len(fullName)-len(expectedName):] == expectedName
 }
 
 // Close releases the Docker client resources.
@@ -98,4 +427,170 @@ func (c *Client) Close() error {
 		return c.cli.Close()
 	}
 	return nil
+}
+
+func (c *Client) resolveContainer(ctx context.Context, serviceName string) (string, string, error) {
+	byService, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", "com.docker.compose.service="+serviceName),
+		),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("resolving service %s: %w", serviceName, err)
+	}
+
+	if len(byService) > 0 {
+		picked := pickContainer(byService)
+		return picked.ID, firstContainerName(picked), nil
+	}
+
+	byName, err := c.cli.ContainerList(ctx, containerapi.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("name", serviceName),
+		),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("resolving container name %s: %w", serviceName, err)
+	}
+
+	if len(byName) == 0 {
+		return "", "", fmt.Errorf("container %s not found", serviceName)
+	}
+
+	picked := pickContainer(byName)
+	return picked.ID, firstContainerName(picked), nil
+}
+
+func pickContainer(list []types.Container) types.Container {
+	for _, ctr := range list {
+		if ctr.State == "running" {
+			return ctr
+		}
+	}
+	return list[0]
+}
+
+func firstContainerName(ctr types.Container) string {
+	if len(ctr.Names) == 0 {
+		if len(ctr.ID) > 12 {
+			return ctr.ID[:12]
+		}
+		return ctr.ID
+	}
+	return strings.TrimPrefix(ctr.Names[0], "/")
+}
+
+func (c *Client) runInContainer(ctx context.Context, containerID string, cmd []string) error {
+	execResp, err := c.cli.ContainerExecCreate(ctx, containerID, types.ExecConfig{
+		User:         "0",
+		Privileged:   true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Cmd:          cmd,
+	})
+	if err != nil {
+		return fmt.Errorf("creating exec in container: %w", err)
+	}
+
+	attach, err := c.cli.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("attaching exec: %w", err)
+	}
+	defer attach.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if _, err := stdcopy.StdCopy(&stdout, &stderr, attach.Reader); err != nil && err != io.EOF {
+		return fmt.Errorf("reading exec output: %w", err)
+	}
+
+	inspect, err := c.cli.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("inspecting exec result: %w", err)
+	}
+
+	if inspect.ExitCode != 0 {
+		out := strings.TrimSpace(stdout.String())
+		errOut := strings.TrimSpace(stderr.String())
+		if errOut != "" {
+			out = errOut
+		}
+		if out == "" {
+			out = "command failed without output"
+		}
+		return fmt.Errorf("exec exit code %d: %s", inspect.ExitCode, out)
+	}
+
+	return nil
+}
+
+func (c *Client) inferPrimaryNetwork(ctx context.Context, containerID string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspecting container networks: %w", err)
+	}
+
+	if info.NetworkSettings == nil || info.NetworkSettings.Networks == nil {
+		return "", fmt.Errorf("container has no network settings")
+	}
+
+	for netName := range info.NetworkSettings.Networks {
+		if strings.Contains(netName, "payflow-net") {
+			return netName, nil
+		}
+	}
+
+	for netName := range info.NetworkSettings.Networks {
+		return netName, nil
+	}
+
+	return "", fmt.Errorf("no networks found for container")
+}
+
+func (c *Client) ensureNetwork(ctx context.Context, networkName string) error {
+	_, err := c.cli.NetworkInspect(ctx, networkName, types.NetworkInspectOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("inspecting network %s: %w", networkName, err)
+	}
+
+	_, err = c.cli.NetworkCreate(ctx, networkName, types.NetworkCreate{
+		CheckDuplicate: true,
+		Driver:         "bridge",
+		Attachable:     true,
+		Labels: map[string]string{
+			"com.payflow.chaos": "true",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("creating network %s: %w", networkName, err)
+	}
+
+	return nil
+}
+
+func isPayflowContainerName(name string) bool {
+	if strings.Contains(name, "coordinator-") {
+		return true
+	}
+	if strings.Contains(name, "worker-") {
+		return true
+	}
+	if strings.Contains(name, "api-gateway") {
+		return true
+	}
+	if strings.Contains(name, "payment-log") {
+		return true
+	}
+	if strings.Contains(name, "monitor") {
+		return true
+	}
+	if strings.Contains(name, "jaeger") {
+		return true
+	}
+	return false
 }

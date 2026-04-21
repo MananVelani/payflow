@@ -1,18 +1,21 @@
-# Placeholder Dockerfile for PayFlow services (Members 1-4)
-# Each member copies this into their service directory and replaces with real code in Weeks 2-3.
+# C4 Payment Log Dockerfile
 
-FROM golang:1.22-alpine AS builder
-WORKDIR /build
-COPY main.go .
-RUN go mod init placeholder && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /placeholder .
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+RUN apk add --no-cache git
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY proto ./proto
+COPY payment-log ./payment-log
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /payment-log ./payment-log
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /audit ./payment-log/audit
 
 FROM alpine:3.19 AS final
-RUN apk add --no-cache ca-certificates wget
-RUN adduser -D -u 1001 app
-COPY --from=builder /placeholder /placeholder
-USER app
-EXPOSE 8080 2112
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
-ENTRYPOINT ["/placeholder"]
+RUN apk add --no-cache ca-certificates wget busybox-extras iproute2
+COPY --from=builder /payment-log /payment-log
+COPY --from=builder /audit /usr/local/bin/payflow-audit
+EXPOSE 50054 2112 2113
+ENTRYPOINT ["/payment-log"]

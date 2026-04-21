@@ -19,6 +19,7 @@ import (
 	"github.com/payflow/monitor/dashboard"
 	"github.com/payflow/monitor/health"
 	"github.com/payflow/monitor/metrics"
+	"github.com/payflow/monitor/scaling"
 	"github.com/payflow/monitor/scraper"
 )
 
@@ -42,6 +43,26 @@ func main() {
 	// 3. Create scraper
 	scr := scraper.New(cfg, m)
 
+	// 3.1 Optional autoscaler
+	var autoScaler *scaling.Scaler
+	var dockerScalerClient *scaling.DockerClient
+	if cfg.ScalingEnabled {
+		dockerClient, err := scaling.NewDockerClient(cfg.ScaleTemplateWorker)
+		if err != nil {
+			log.Printf("[monitor] autoscaling disabled: %v", err)
+		} else {
+			dockerScalerClient = dockerClient
+			autoScaler = scaling.New(
+				dockerScalerClient,
+				cfg.ScaleQueueThreshold,
+				cfg.ScaleMaxWorkers,
+				cfg.ScaleCooldown,
+			)
+			scr.Subscribe(autoScaler.OnSnapshot)
+			log.Println("[monitor] autoscaling watcher initialized")
+		}
+	}
+
 	// 4. Create dashboard WebSocket server
 	dash := dashboard.NewServer(scr, m)
 
@@ -56,7 +77,6 @@ func main() {
 	// Main mux: dashboard + health + WebSocket + API state (port 3000)
 	mainMux := http.NewServeMux()
 	mainMux.HandleFunc("/health", healthHandler)
-	mainMux.HandleFunc("/api/state", dash.HandleAPIState)
 	dash.RegisterRoutes(mainMux)
 
 	// Prometheus mux: /metrics endpoint (port 9091)
@@ -71,6 +91,9 @@ func main() {
 	// 9. Start goroutines
 	go scr.Start(ctx)
 	go dash.Start(ctx)
+	if autoScaler != nil {
+		go autoScaler.Start(ctx)
+	}
 
 	go func() {
 		mainAddr := ":" + cfg.HTTPPort
@@ -96,6 +119,11 @@ func main() {
 
 	// 11. Cancel context and allow goroutines to drain
 	cancel()
+	if dockerScalerClient != nil {
+		if err := dockerScalerClient.Close(); err != nil {
+			log.Printf("[monitor] autoscaler Docker client close error: %v", err)
+		}
+	}
 	time.Sleep(2 * time.Second)
 	log.Println("[monitor] C5 Monitoring Service stopped")
 	os.Exit(0)

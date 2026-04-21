@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"os"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -16,7 +17,12 @@ var bucket = []byte("payments")
 var idempotencyBucket = []byte("idempotency")
 
 func NewStore() *Store {
-	db, err := bolt.Open("payments.db", 0600, nil)
+	dbPath := os.Getenv("BOLT_PATH")
+	if dbPath == "" {
+		dbPath = "payments.db"
+	}
+
+	db, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,36 +36,47 @@ func NewStore() *Store {
 	return &Store{db: db}
 }
 
-func (s *Store) Save(txnID string, data interface{}) {
+func (s *Store) Save(txnID string, data interface{}) uint64 {
+	var seq uint64
 	s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucket)
+		seq, _ = b.NextSequence()
 		bytes, _ := json.Marshal(data)
 		return b.Put([]byte(txnID), bytes)
 	})
+	return seq
 }
 
-func(s *Store) CheckIdempotency(key string) (bool, string, bool) {
-	var taxnID string
+func (s *Store) CheckIdempotency(key string) (bool, string, bool) {
+	var txnID string
 	var success bool
+
 	s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(idempotencyBucket)
 		data := b.Get([]byte(key))
 		if data == nil {
-			return nil;
+			return nil
 		}
+
 		var result struct {
-			TxnID   string
+			TxnID  string
 			Success bool
 		}
-		json.Unmarshal(data, &result)
-		taxnID = result.TxnID
+
+		if err := json.Unmarshal(data, &result); err != nil {
+			return nil
+		}
+
+		txnID = result.TxnID
 		success = result.Success
 		return nil
 	})
-	if taxnID == "" {
+
+	if txnID == "" {
 		return false, "", false
 	}
-	return true, taxnID, success
+
+	return true, txnID, success
 }
 
 func (s *Store) WriteResult(key, txnID string, success bool) {
@@ -76,4 +93,64 @@ func (s *Store) WriteResult(key, txnID string, success bool) {
 
 		return b.Put([]byte(key), data)
 	})
+}
+
+func (s *Store) GetAllPending(epoch int64) []interface{} {
+	var results []interface{}
+
+	s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+
+		b.ForEach(func(k, v []byte) error {
+			var entry map[string]interface{}
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return nil
+			}
+
+			state, _ := entry["state"].(string)
+			// (Removed entryEpoch parsing since we want tasks from all epochs)
+
+			if state == "QUEUED" || state == "IN_PROGRESS" {
+
+				results = append(results, entry)
+			}
+
+			return nil
+		})
+
+		return nil
+	})
+
+	return results
+}
+
+func (s *Store) SaveEpoch(epoch int64) {
+	s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket) // Reusing the main bucket
+		
+		data, _ := json.Marshal(map[string]int64{"epoch": epoch})
+		return b.Put([]byte("CURRENT_EPOCH"), data)
+	})
+}
+
+func (s *Store) GetEpoch() int64 {
+	var epoch int64 = 1 // Default to 1 if it doesn't exist
+
+	s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+		data := b.Get([]byte("CURRENT_EPOCH"))
+		if data == nil {
+			return nil
+		}
+		
+		var result map[string]int64
+		if err := json.Unmarshal(data, &result); err == nil {
+			if val, ok := result["epoch"]; ok {
+				epoch = val
+			}
+		}
+		return nil
+	})
+
+	return epoch
 }
