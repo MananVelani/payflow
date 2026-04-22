@@ -109,6 +109,10 @@ type CoordinatorNode struct {
 	TaskQueue chan *workerPb.TaskAssignment
 	InFlight  map[string]*workerPb.TaskAssignment
 
+	// workerScores tracks a performance score per worker for weighted dispatch.
+	// Score = (1-failRate) / (avgLatencyMs+1). Higher is better.
+	workerScores map[string]float64
+
 	mu sync.Mutex
 
 	c4Client    logPb.PaymentLogServiceClient
@@ -130,6 +134,7 @@ func parseNodeID(id string) int {
 	return 0 // Fallback if parsing fails
 }
 
+// Election handles a Bully Algorithm election request from a peer node.
 func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMessage) (*coordPb.ElectionResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -162,7 +167,11 @@ func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMes
 
 	if candidateID < myID {
 		log.Printf("[DEBUG-TRACE] Node %s | FIGHTING BACK against weaker node %s. Triggering my own election.", c.ID, req.CandidateId)
-		go c.triggerElection() // Step down and start our own election to crush them
+		if c.State == "LEADER" {
+			go c.broadcastCoordinator() // Re-announce leadership
+		} else {
+			go c.triggerElection() // Step down and start our own election to crush them
+		}
 	}
 
 	return &coordPb.ElectionResponse{
@@ -223,6 +232,7 @@ func (c *CoordinatorNode) AnnounceCoordinator(ctx context.Context, req *coordPb.
 // 2. PAYMENT GATEWAY SERVICE (From C1 Gateway)
 // ---------------------------------------------------------
 
+// SubmitTask receives a new payment task from the API gateway and queues it.
 func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitTaskRequest) (*paymentPb.SubmitTaskResponse, error) {
 	c.mu.Lock()
 	isLeader := c.State == "LEADER"
@@ -275,6 +285,22 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 
 	log.Printf("[LEADER %s] Successfully wrote to C4 log! Index: %d", c.ID, logRes.LogIndex)
 
+	// 3b. --- 2-PHASE COMMIT for high-value payments (> $10,000) ---
+	if req.Amount > 10000.0 {
+		log.Printf("[LEADER %s] High-value payment ($%.2f) — initiating 2PC PREPARE", c.ID, req.Amount)
+		prepCtx, prepCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		prepRes, prepErr := c.c4Client.HandlePrepare(prepCtx, &logPb.TxnRequest{
+			Epoch: c.Epoch,
+			TxnId: txnID,
+		})
+		prepCancel()
+		if prepErr != nil || (prepRes != nil && !prepRes.Success) {
+			log.Printf("[LEADER %s] 2PC PREPARE failed for txn %s — aborting", c.ID, txnID)
+			return nil, status.Errorf(codes.Aborted, "2PC prepare failed, payment not dispatched")
+		}
+		log.Printf("[LEADER %s] 2PC PREPARE OK for txn %s", c.ID, txnID)
+	}
+
 	// 4. --- PUSH TO WORKER QUEUE (Bounded) ---
 	newTask := &workerPb.TaskAssignment{
 		Epoch:          c.Epoch,
@@ -310,6 +336,7 @@ func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitT
 // 3. WORKER MANAGEMENT SERVICE (From C3 Workers)
 // ---------------------------------------------------------
 
+// RegisterWorker registers a newly spun-up worker with the leader coordinator.
 func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.RegisterRequest) (*workerPb.RegisterResponse, error) {
 	c.mu.Lock()
 	isLeader := c.State == "LEADER"
@@ -338,6 +365,20 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 			log.Printf("[LEADER %s] New worker joined the pool: %s", c.ID, req.WorkerId)
 		}
 		c.Workers[req.WorkerId] = time.Now() // Update last seen timestamp
+
+		// A02: Update worker score for weighted load balancing.
+		// Score = (1 - failRate) / (avgLatencyMs + 1); higher = better worker
+		if req.CurrentLoad > 0 || req.AvgTaskDurationMs > 0 {
+			failRate := float64(req.CurrentLoad) / 100.0 // treat CurrentLoad as fail % proxy
+			latencyMs := float64(req.AvgTaskDurationMs)
+			if latencyMs <= 0 {
+				latencyMs = 1
+			}
+			score := (1.0 - failRate) / (latencyMs + 1.0)
+			c.workerScores[req.WorkerId] = score
+			log.Printf("[LEADER %s] Worker %s score updated: %.4f (load=%d, latency=%.0fms)",
+				c.ID, req.WorkerId, score, req.CurrentLoad, latencyMs)
+		}
 	}
 
 	return &workerPb.HeartbeatResponse{
@@ -347,9 +388,7 @@ func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.Heartbeat
 
 // startLeaderHeartbeat continuously suppresses follower elections
 func (c *CoordinatorNode) startLeaderHeartbeat() {
-	c.mu.Lock()
-	startingEpoch := c.Epoch
-	c.mu.Unlock()
+
 
 	log.Printf("[LEADER %s] Starting dedicated per-peer heartbeat tickers...", c.ID)
 
@@ -366,7 +405,7 @@ func (c *CoordinatorNode) startLeaderHeartbeat() {
 				c.mu.Unlock()
 
 				// If we step down, this specific peer's goroutine quietly exits
-				if state != "LEADER" || curEpoch != startingEpoch {
+				if state != "LEADER" {
 					return 
 				}
 
@@ -395,10 +434,18 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader", c.ID)
 	}
 
-	delete(c.InFlight, req.WorkerId) // Remove from in-flight tracking immediately to prevent double-processing
+	// Retrieve idempotency key from the in-flight task map BEFORE deleting it.
+	// We cannot rely on the gRPC wire field because the shared binary proto descriptor
+	// does not include idempotency_key in TaskResult, so the field gets dropped on deserialization.
+	idempotencyKey := req.GetIdempotencyKey() // try wire field first (works for same-binary workers)
+	if inFlightTask, ok := c.InFlight[req.TaskId]; ok && idempotencyKey == "" {
+		idempotencyKey = inFlightTask.GetIdempotencyKey()
+	}
+
+	delete(c.InFlight, req.TaskId) // Remove from in-flight tracking by TaskId
 	c.mu.Unlock()
 
-	log.Printf("[LEADER %s] Processing task result for %s from worker %s", c.ID, req.TaskId, req.WorkerId)
+	log.Printf("[LEADER %s] Processing task result for %s from worker %s (idemp_key=%s)", c.ID, req.TaskId, req.WorkerId, idempotencyKey)
 
 	// 1. Determine if the worker succeeded or failed
 	isSuccess := req.GetSuccess()
@@ -409,12 +456,11 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 	}
 
 	// 2. --- FORWARD RESULT TO C4 (Payment Log Service) ---
-	// FIX: Removed the Dial/NewClient block to prevent connection exhaustion
 	if c.c4Client != nil {
 		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
 			TxnId:          req.TaskId,
 			Success:        isSuccess,
-			IdempotencyKey: req.GetIdempotencyKey(),
+			IdempotencyKey: idempotencyKey,
 		})
 
 		if err != nil {
@@ -422,6 +468,20 @@ func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskRe
 		} else {
 			log.Printf("[LEADER %s] Permanently recorded task %s outcome to C4.", c.ID, req.TaskId)
 		}
+
+		// A03: 2PC COMMIT / ROLLBACK for high-value payments.
+		// We check the 2PC bucket by attempting commit; if not prepared, it's a no-op.
+		var txnCtx context.Context
+		var txnCancel context.CancelFunc
+		txnCtx, txnCancel = context.WithTimeout(context.Background(), 2*time.Second)
+		if isSuccess {
+			_, _ = c.c4Client.HandleCommit(txnCtx, &logPb.TxnRequest{Epoch: c.Epoch, TxnId: req.TaskId})
+			log.Printf("[LEADER %s] 2PC COMMIT sent for task %s", c.ID, req.TaskId)
+		} else {
+			_, _ = c.c4Client.HandleRollback(txnCtx, &logPb.TxnRequest{Epoch: c.Epoch, TxnId: req.TaskId})
+			log.Printf("[LEADER %s] 2PC ROLLBACK sent for task %s", c.ID, req.TaskId)
+		}
+		txnCancel()
 	} else {
 		log.Printf("[LEADER %s] Skip C4 update: Persistent client is nil", c.ID)
 	}
@@ -450,6 +510,21 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 
 	// Listen for either a new task or the client disconnecting
 	for {
+		c.mu.Lock()
+		score, exists := c.workerScores[req.WorkerId]
+		c.mu.Unlock()
+
+		// A02: Weighted Load Balancing
+		// If score is low, intentionally delay this worker from eagerly grabbing the next task
+		if exists && score < 0.8 {
+			penalty := time.Duration((1.0-score)*50) * time.Millisecond
+			select {
+			case <-time.After(penalty):
+			case <-stream.Context().Done():
+				return nil
+			}
+		}
+
 		select {
 		case <-stream.Context().Done():
 			// The worker closed the connection or timed out.
@@ -474,7 +549,7 @@ func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.W
 				return err
 			}
 			c.mu.Lock()
-			c.InFlight[req.WorkerId] = task
+			c.InFlight[task.TaskId] = task
 			c.mu.Unlock()
 		}
 	}
@@ -898,9 +973,10 @@ func main() {
 		State:         "FOLLOWER",
 		Epoch:         int64(0),
 		Workers:       make(map[string]time.Time),
+		workerScores:  make(map[string]float64),
 		leaderTimeout: 5 * time.Second,
 		resetTimer:    make(chan bool, 1),
-		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
+		TaskQueue:     make(chan *workerPb.TaskAssignment, 2000),
 		InFlight:      make(map[string]*workerPb.TaskAssignment),
 		c4Client:      c4Client,
 		peerClients:   peerClients,

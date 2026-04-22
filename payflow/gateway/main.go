@@ -73,6 +73,7 @@ func initTracer() (*sdktrace.TracerProvider, error) {
 	return tp, nil
 }
 
+// NewGateway creates a new API Gateway instance pointing to an initial leader.
 func NewGateway(initialLeader string) *Gateway {
 	gw := &Gateway{
 		leaderAddr: initialLeader,
@@ -154,6 +155,19 @@ func handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "payflow_gateway_requests_total %d\n", total)
 }
 
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func main() {
 	tp, err := initTracer()
 	if err != nil {
@@ -168,10 +182,10 @@ func main() {
 	tracer := otel.Tracer("payflow/gateway")
 	gw := NewGateway("coordinator-1:50051")
 
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/metrics", handleMetrics)
+	http.HandleFunc("/health", withCORS(handleHealth))
+	http.HandleFunc("/metrics", withCORS(handleMetrics))
 
-	http.HandleFunc("/v1/payments", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/v1/payments", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddUint64(&gatewayRequestTotal, 1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -256,9 +270,9 @@ func main() {
 			"status":   "QUEUED",
 			"trace_id": span.SpanContext().TraceID().String(),
 		})
-	})
+	}))
 
-	http.HandleFunc("/v1/payments/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/v1/payments/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddUint64(&gatewayRequestTotal, 1)
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -327,7 +341,7 @@ func main() {
 			"status":   resp.GetStatus(),
 			"trace_id": span.SpanContext().TraceID().String(),
 		})
-	})
+	}))
 
 	http.HandleFunc("/v1/batch", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddUint64(&gatewayRequestTotal, 1)

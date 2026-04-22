@@ -30,8 +30,9 @@ func NewC2Client(conn *grpc.ClientConn, logger *zap.Logger) *C2Client {
 // This satisfies the service.ReportResultFunc signature when wrapped.
 func (c *C2Client) ReportResult(ctx context.Context, result *domain.PaymentResult) error {
 	req := &pb.TaskResult{
-		TaskId:   result.TaskID,
-		WorkerId: result.WorkerID,
+		TaskId:         result.TaskID,
+		WorkerId:       result.WorkerID,
+		IdempotencyKey: result.IdempotencyKey,
 		// Epoch is filled by the service layer now
 	}
 

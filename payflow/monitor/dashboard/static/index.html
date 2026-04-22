@@ -3,532 +3,655 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PayFlow Monitor</title>
+    <title>PayFlow Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-color: #050505;
+            --panel-bg: #111111;
+            --panel-border: #222222;
+            --text-primary: #e0e0e0;
+            --text-secondary: #888888;
+            --accent-green: #00ff88;
+            --accent-green-dim: rgba(0, 255, 136, 0.1);
+            --accent-blue: #00aaff;
+            --accent-orange: #ffaa00;
+            --accent-red: #ff3333;
+            --accent-red-dim: rgba(255, 51, 51, 0.1);
+            --gradient-primary: linear-gradient(135deg, #00ff88 0%, #00aaff 100%);
+        }
+
         *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
-            background: #0d0d0d;
-            color: #e0e0e0;
-            font-family: "JetBrains Mono", "Fira Code", "Consolas", "Courier New", monospace;
+            background: var(--bg-color);
+            color: var(--text-primary);
+            font-family: 'Inter', sans-serif;
             min-height: 100vh;
-            padding: 16px;
+            padding: 20px;
         }
 
-        /* ═══ HEADER ═══ */
         .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 12px 20px;
-            background: #141414;
-            border: 1px solid #2a2a2a;
-            border-radius: 8px;
-            margin-bottom: 16px;
+            padding: 16px 24px;
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
         }
+
         .header-left h1 {
-            font-size: 22px;
-            color: #00ff88;
-            text-shadow: 0 0 12px rgba(0,255,136,0.25);
+            font-size: 24px;
+            font-weight: 700;
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
         }
-        .header-left .version {
-            font-size: 11px;
-            color: #555;
-            margin-top: 2px;
+
+        .header-left .subtitle {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            margin-top: 4px;
         }
+
         .status-pill {
-            padding: 6px 14px;
+            padding: 6px 16px;
             border-radius: 20px;
             font-size: 12px;
-            font-weight: bold;
-            border: 1px solid #2a2a2a;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid var(--panel-border);
+            transition: all 0.3s ease;
         }
-        .status-live { background: #0a2e1a; color: #00ff88; border-color: #00ff88; }
-        .status-stale { background: #2e2a0a; color: #f5a623; border-color: #f5a623; }
-        .status-disconnected { background: #2e0a0a; color: #ff4444; border-color: #ff4444; }
+        .status-live { background: var(--accent-green-dim); color: var(--accent-green); border-color: var(--accent-green); box-shadow: 0 0 10px var(--accent-green-dim); }
+        .status-stale { background: rgba(255, 170, 0, 0.1); color: var(--accent-orange); border-color: var(--accent-orange); }
+        .status-disconnected { background: var(--accent-red-dim); color: var(--accent-red); border-color: var(--accent-red); }
 
-        /* ═══ GRID LAYOUT ═══ */
-        .main-grid {
+        .dashboard-grid {
             display: grid;
-            grid-template-columns: 280px 1fr;
-            gap: 16px;
-            margin-bottom: 16px;
-        }
-        @media (max-width: 768px) {
-            .main-grid { grid-template-columns: 1fr; }
-        }
-        .bottom-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-        }
-        @media (max-width: 768px) {
-            .bottom-grid { grid-template-columns: 1fr; }
+            grid-template-columns: 1fr 320px;
+            gap: 20px;
         }
 
-        /* ═══ PANELS ═══ */
+        .main-column {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .side-column {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
         .panel {
-            background: #141414;
-            border: 1px solid #2a2a2a;
-            border-radius: 8px;
-            padding: 16px;
-        }
-        .panel-title {
-            font-size: 11px;
-            color: #888;
-            text-transform: uppercase;
-            letter-spacing: 1.5px;
-            margin-bottom: 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #222;
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
         }
 
-        /* ═══ COORDINATOR RING ═══ */
-        .coord-row {
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--panel-border);
+        }
+
+        .panel-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* Stats Row */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+        }
+        
+        .stat-card {
+            background: #161616;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #2a2a2a;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-green);
+            margin-bottom: 4px;
+        }
+        
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Pipeline Diagram */
+        .pipeline-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            position: relative;
+        }
+
+        .pipeline-node {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            z-index: 2;
+        }
+
+        .node-circle {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: #1a1a1a;
+            border: 2px solid #333;
             display: flex;
             align-items: center;
-            gap: 10px;
-            padding: 10px 8px;
-            border-radius: 4px;
-            margin-bottom: 6px;
-            transition: opacity 0.3s ease;
+            justify-content: center;
+            font-weight: 700;
+            color: var(--text-secondary);
+            transition: all 0.3s ease;
         }
-        .coord-row.dead { opacity: 0.4; }
-        .coord-icon { font-size: 18px; width: 24px; text-align: center; }
-        .coord-info { flex: 1; }
-        .coord-name { font-size: 13px; color: #e0e0e0; }
-        .coord-epoch { font-size: 11px; color: #666; margin-top: 2px; }
+
+        .node-circle.active {
+            border-color: var(--accent-green);
+            color: var(--accent-green);
+            box-shadow: 0 0 15px rgba(0,255,136,0.2);
+        }
+
+        .node-circle.down {
+            border-color: var(--accent-red);
+            color: var(--accent-red);
+            box-shadow: 0 0 15px rgba(255,51,51,0.2);
+        }
+
+        .node-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .pipeline-line {
+            position: absolute;
+            top: 50%;
+            left: 24px;
+            right: 24px;
+            height: 2px;
+            background: #333;
+            transform: translateY(-24px);
+            z-index: 1;
+        }
+
+        /* Cluster Status */
+        .cluster-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .node-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .node-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: #161616;
+            border-radius: 6px;
+            border: 1px solid #2a2a2a;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
 
         .badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-        .badge-leader { background: #f5a623; color: #1a1a1a; }
-        .badge-follower { background: #2d6ae0; color: #ffffff; }
-        .badge-candidate {
-            background: #e07d2d;
-            color: #ffffff;
-            animation: pulse 1.2s infinite;
-        }
-        .badge-dead { background: #c0392b; color: #ffffff; }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-
-        .election-banner {
-            display: none;
-            background: #2e2a0a;
-            border: 1px solid #f5a623;
-            color: #f5a623;
-            text-align: center;
-            padding: 8px;
+            padding: 2px 8px;
             border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-            margin-top: 8px;
+            font-size: 10px;
+            font-weight: 700;
         }
-        .election-banner.visible { display: block; }
+        .badge-leader { background: rgba(255,170,0,0.2); color: var(--accent-orange); }
+        .badge-follower { background: rgba(0,170,255,0.2); color: var(--accent-blue); }
+        .badge-alive { background: rgba(0,255,136,0.2); color: var(--accent-green); }
+        .badge-dead { background: rgba(255,51,51,0.2); color: var(--accent-red); }
 
-        /* ═══ WORKER GRID ═══ */
-        .worker-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-            gap: 10px;
+        /* Payment Submission */
+        .form-group {
+            margin-bottom: 16px;
         }
-        .worker-card {
-            background: #1e1e1e;
+        
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+        
+        .form-control {
+            width: 100%;
+            padding: 10px;
+            background: #000;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        
+        .form-control:focus {
+            outline: none;
+            border-color: var(--accent-green);
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--gradient-primary);
+            border: none;
+            border-radius: 6px;
+            color: #000;
+            font-weight: 700;
+            font-size: 14px;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        
+        .btn:hover { opacity: 0.9; }
+        .btn:active { transform: scale(0.98); }
+
+        /* 2PC Stats */
+        .twopc-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .twopc-stat {
+            background: #161616;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+            border: 1px solid #2a2a2a;
+        }
+
+        .twopc-val {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 18px;
+            font-weight: 700;
+        }
+        .twopc-label {
+            font-size: 10px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        /* Live Event Feed */
+        .event-feed {
+            height: 250px;
+            overflow-y: auto;
+            background: #000;
             border: 1px solid #2a2a2a;
             border-radius: 6px;
-            padding: 12px;
-            text-align: center;
-            transition: background 0.4s ease, border-color 0.4s ease;
-        }
-        .worker-card.dead-border { border-color: #c0392b; }
-        .worker-card.flash-alive { background: #1e2e1e; }
-        .worker-card.flash-dead { background: #2e1e1e; }
-        .worker-name { font-size: 12px; color: #aaa; margin-bottom: 6px; }
-        .worker-badge { margin-bottom: 4px; }
-        .badge-alive { background: #27ae60; color: #fff; }
-        .badge-worker-dead { background: #c0392b; color: #fff; }
-        .worker-stat { font-size: 11px; color: #666; margin-top: 3px; }
-
-        /* ═══ QUEUE GAUGE ═══ */
-        .queue-bar-container {
-            background: #1e1e1e;
-            border-radius: 4px;
-            height: 28px;
-            overflow: hidden;
-            margin-bottom: 8px;
-        }
-        .queue-bar-fill {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.4s ease, background 0.3s ease;
-            min-width: 0;
-        }
-        .queue-green { background: #27ae60; }
-        .queue-amber { background: #f39c12; }
-        .queue-red { background: #c0392b; }
-        .queue-label { font-size: 12px; color: #888; text-align: center; }
-
-        /* ═══ THROUGHPUT SPARKLINE ═══ */
-        .throughput-container {
-            display: flex;
-            align-items: flex-end;
-            gap: 2px;
-            height: 60px;
-            margin-bottom: 8px;
-        }
-        .spark-bar {
-            width: 6px;
-            min-height: 2px;
-            background: #00ff88;
-            border-radius: 1px 1px 0 0;
-            transition: height 0.3s ease;
-            opacity: 0.7;
-        }
-        .throughput-value {
-            font-size: 20px;
-            color: #00ff88;
-            font-weight: bold;
-            text-align: center;
-        }
-        .throughput-unit {
+            padding: 10px;
+            font-family: 'JetBrains Mono', monospace;
             font-size: 11px;
-            color: #666;
-            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
         }
+
+        .event-line {
+            padding: 6px;
+            border-radius: 4px;
+            background: #111;
+            border-left: 3px solid #333;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .event-line.success { border-left-color: var(--accent-green); }
+        .event-line.error { border-left-color: var(--accent-red); }
+        .event-line.info { border-left-color: var(--accent-blue); }
+        .event-time { color: #666; margin-right: 8px; }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #111; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-left">
-            <h1>&#x2B21; PayFlow Monitor</h1>
-            <div class="version">PayFlow v0.2.0 &#183; C5 Monitor</div>
+            <h1>PayFlow Dashboard</h1>
+            <div class="subtitle">Distributed Payment Infrastructure v1.0</div>
         </div>
-        <div id="status-pill" class="status-pill status-disconnected">&#x1F534; Disconnected</div>
+        <div id="status-pill" class="status-pill status-disconnected">Disconnected</div>
     </div>
 
-    <div class="main-grid">
-        <div class="panel">
-            <div class="panel-title">Coordinator Ring</div>
-            <div id="coord-ring"></div>
-            <div id="election-banner" class="election-banner">&#x26A1; ELECTION IN PROGRESS</div>
-        </div>
-
-        <div class="panel">
-            <div class="panel-title">Worker Health</div>
-            <div id="worker-grid" class="worker-grid"></div>
-        </div>
-    </div>
-
-    <div class="bottom-grid">
-        <div class="panel">
-            <div class="panel-title">Task Queue Depth</div>
-            <div class="queue-bar-container">
-                <div id="queue-fill" class="queue-bar-fill queue-green" style="width:0%"></div>
+    <div class="dashboard-grid">
+        <div class="main-column">
+            <!-- Stats Bar -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div id="stat-tps" class="stat-value">0.0</div>
+                    <div class="stat-label">Tasks / Min</div>
+                </div>
+                <div class="stat-card">
+                    <div id="stat-queue" class="stat-value">0</div>
+                    <div class="stat-label">Queue Depth</div>
+                </div>
+                <div class="stat-card">
+                    <div id="stat-log" class="stat-value">0</div>
+                    <div class="stat-label">Log Appends</div>
+                </div>
+                <div class="stat-card">
+                    <div id="stat-idempotency" class="stat-value" style="color: var(--accent-blue)">0</div>
+                    <div class="stat-label">Idemp. Hits</div>
+                </div>
             </div>
-            <div id="queue-label" class="queue-label">Queue empty &#x2713;</div>
+
+            <!-- Pipeline Diagram -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">System Pipeline</div>
+                </div>
+                <div class="pipeline-container">
+                    <div class="pipeline-line"></div>
+                    <div class="pipeline-node">
+                        <div class="node-circle active">CLI</div>
+                        <div class="node-label">Client</div>
+                    </div>
+                    <div class="pipeline-node">
+                        <div id="node-gw" class="node-circle">C1</div>
+                        <div class="node-label">Gateway</div>
+                    </div>
+                    <div class="pipeline-node">
+                        <div id="node-coord" class="node-circle">C2</div>
+                        <div class="node-label">Coordinator</div>
+                    </div>
+                    <div class="pipeline-node">
+                        <div id="node-log" class="node-circle">C4</div>
+                        <div class="node-label">Payment Log</div>
+                    </div>
+                    <div class="pipeline-node">
+                        <div id="node-worker" class="node-circle">C3</div>
+                        <div class="node-label">Workers</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Cluster Status -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Cluster Nodes</div>
+                </div>
+                <div class="cluster-grid">
+                    <div>
+                        <h4 style="font-size: 12px; color: var(--text-secondary); margin-bottom: 10px;">Coordinators</h4>
+                        <div id="coord-list" class="node-list"></div>
+                    </div>
+                    <div>
+                        <h4 style="font-size: 12px; color: var(--text-secondary); margin-bottom: 10px;">Workers</h4>
+                        <div id="worker-list" class="node-list"></div>
+                    </div>
+                </div>
+            </div>
         </div>
 
-        <div class="panel">
-            <div class="panel-title">Throughput</div>
-            <div class="throughput-container" id="spark-container"></div>
-            <div id="throughput-value" class="throughput-value">0.0</div>
-            <div class="throughput-unit">tasks / min</div>
+        <div class="side-column">
+            <!-- Payment Submission -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Submit Payment</div>
+                </div>
+                <form id="payment-form">
+                    <div class="form-group">
+                        <label>Amount (USD)</label>
+                        <input type="number" id="pay-amount" class="form-control" value="100.50" step="0.01" required>
+                        <small style="color:var(--text-secondary); font-size:10px; margin-top:4px; display:block;">Amounts > $10,000 trigger 2-Phase Commit</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Idempotency Key</label>
+                        <input type="text" id="pay-idemp" class="form-control" value="" required>
+                    </div>
+                    <button type="submit" class="btn" id="pay-btn">Submit to Gateway</button>
+                </form>
+            </div>
+
+            <!-- 2PC Stats -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">2-Phase Commit Ledger</div>
+                </div>
+                <div class="twopc-grid">
+                    <div class="twopc-stat">
+                        <div id="2pc-prep" class="twopc-val" style="color: var(--accent-blue)">0</div>
+                        <div class="twopc-label">PREPARED</div>
+                    </div>
+                    <div class="twopc-stat">
+                        <div id="2pc-com" class="twopc-val" style="color: var(--accent-green)">0</div>
+                        <div class="twopc-label">COMMITTED</div>
+                    </div>
+                    <div class="twopc-stat">
+                        <div id="2pc-roll" class="twopc-val" style="color: var(--accent-red)">0</div>
+                        <div class="twopc-label">ROLLED BACK</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Event Feed -->
+            <div class="panel" style="flex: 1; display: flex; flex-direction: column;">
+                <div class="panel-header">
+                    <div class="panel-title">Live Event Feed</div>
+                </div>
+                <div id="event-feed" class="event-feed"></div>
+            </div>
         </div>
     </div>
 
     <script>
-        (function() {
-            "use strict";
+        // Generate random idempotency key on load
+        document.getElementById('pay-idemp').value = 'idemp-' + Math.random().toString(36).substr(2, 9);
 
-            var wsURL = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws";
-            var ws = null;
-            var reconnectDelay = 3000;
-            var maxReconnectDelay = 30000;
-            var lastSnapshotTime = null;
-            var throughputHistory = [];
-            var MAX_HISTORY = 20;
-            var headerInterval = null;
+        // Payment Submission Logic
+        document.getElementById('payment-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('pay-btn');
+            const amount = parseFloat(document.getElementById('pay-amount').value);
+            const idemp = document.getElementById('pay-idemp').value;
+            
+            btn.disabled = true;
+            btn.textContent = 'Processing...';
 
-            function connect() {
-                console.log("[PayFlow] connecting to " + wsURL);
-                ws = new WebSocket(wsURL);
+            addEvent(`Submitting $${amount} (Key: ${idemp})`, 'info');
 
-                ws.onopen = function() {
-                    console.log("[PayFlow] connected");
-                    reconnectDelay = 3000;
-                    updateStatusPill("live", 0);
-                };
+            try {
+                // Determine port - try gateway first, fallback if running via docker compose
+                const gatewayUrl = window.location.hostname === 'localhost' 
+                    ? 'http://localhost:8080/v1/payments' 
+                    : '/api/v1/payments'; // Assuming proxy
 
-                ws.onmessage = function(event) {
-                    try {
-                        var msg = JSON.parse(event.data);
-                        lastSnapshotTime = new Date();
-                        if (msg.type === "snapshot" && msg.data) {
-                            updateAll(msg.data);
-                        } else if (msg.type === "ping") {
-                            updateHeader(null);
-                        }
-                    } catch (e) {
-                        console.error("[PayFlow] parse error:", e);
-                    }
-                };
+                const res = await fetch('http://localhost:8080/v1/payments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        amount: amount,
+                        currency: "USD",
+                        merchant_id: "dashboard-test",
+                        idempotency_key: idemp
+                    })
+                });
 
-                ws.onclose = function() {
-                    console.log("[PayFlow] disconnected, reconnecting in " + reconnectDelay + "ms");
-                    updateStatusPill("disconnected", 0);
-                    setTimeout(connect, reconnectDelay);
-                    reconnectDelay = Math.min(reconnectDelay * 1.5, maxReconnectDelay);
-                };
-
-                ws.onerror = function(err) {
-                    console.error("[PayFlow] WebSocket error:", err);
-                    ws.close();
-                };
-            }
-
-            // Update header status pill every second
-            headerInterval = setInterval(function() {
-                if (!lastSnapshotTime) return;
-                var ageSecs = (new Date() - lastSnapshotTime) / 1000;
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    if (ageSecs > 30) {
-                        updateStatusPill("stale", ageSecs);
-                    } else {
-                        updateStatusPill("live", ageSecs);
-                    }
-                }
-            }, 1000);
-
-            function updateStatusPill(state, ageSecs) {
-                var pill = document.getElementById("status-pill");
-                var ageStr = ageSecs > 0 ? Math.round(ageSecs) + "s ago" : "";
-                while (pill.firstChild) pill.removeChild(pill.firstChild);
-
-                if (state === "live") {
-                    pill.className = "status-pill status-live";
-                    pill.textContent = "\uD83D\uDFE2 Live \u00B7 scraped " + ageStr;
-                } else if (state === "stale") {
-                    pill.className = "status-pill status-stale";
-                    pill.textContent = "\uD83D\uDFE1 Stale \u00B7 " + ageStr;
+                const data = await res.json();
+                
+                if (res.ok) {
+                    addEvent(`Success: ${data.txn_id}`, 'success');
+                    // Generate new key for next payment
+                    document.getElementById('pay-idemp').value = 'idemp-' + Math.random().toString(36).substr(2, 9);
                 } else {
-                    pill.className = "status-pill status-disconnected";
-                    pill.textContent = "\uD83D\uDD34 Disconnected";
+                    addEvent(`Error: ${data.error || 'Gateway rejected'}`, 'error');
                 }
+            } catch (err) {
+                addEvent(`Failed to connect to API Gateway`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Submit to Gateway';
             }
+        });
 
-            function updateAll(d) {
-                updateCoordinators(d);
-                updateWorkers(d);
-                updateQueue(d);
-                updateThroughput(d);
-            }
+        // Event Feed Logic
+        function addEvent(msg, type) {
+            const feed = document.getElementById('event-feed');
+            const line = document.createElement('div');
+            line.className = `event-line ${type}`;
+            const time = new Date().toLocaleTimeString([], {hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit'});
+            line.innerHTML = `<span class="event-time">[${time}]</span> ${msg}`;
+            feed.prepend(line);
+            if (feed.children.length > 50) feed.lastChild.remove();
+        }
 
-            function updateHeader(d) {
-                // Header is updated by the interval timer
-            }
+        // WebSocket Logic
+        const wsURL = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws";
+        let ws = null;
 
-            function updateCoordinators(d) {
-                var container = document.getElementById("coord-ring");
-                while (container.firstChild) container.removeChild(container.firstChild);
+        function connect() {
+            ws = new WebSocket(wsURL);
+            
+            ws.onopen = () => {
+                document.getElementById('status-pill').className = 'status-pill status-live';
+                document.getElementById('status-pill').textContent = 'Live \u2022 Connected';
+                addEvent('Connected to monitor stream', 'info');
+            };
 
-                var hasLeader = false;
-
-                var coords = d.coordinators || [];
-                for (var i = 0; i < coords.length; i++) {
-                    var c = coords[i];
-                    if (c.state === "LEADER") hasLeader = true;
-
-                    var row = document.createElement("div");
-                    row.className = "coord-row" + (c.state === "DEAD" ? " dead" : "");
-
-                    var icon = document.createElement("span");
-                    icon.className = "coord-icon";
-                    if (c.state === "LEADER") icon.textContent = "\u2605";
-                    else if (c.state === "CANDIDATE") icon.textContent = "\u25CE";
-                    else if (c.state === "DEAD") icon.textContent = "\u2717";
-                    else icon.textContent = "\u25CB";
-
-                    var info = document.createElement("div");
-                    info.className = "coord-info";
-
-                    var name = document.createElement("div");
-                    name.className = "coord-name";
-                    name.textContent = c.node_id;
-
-                    var epoch = document.createElement("div");
-                    epoch.className = "coord-epoch";
-                    epoch.textContent = "epoch: " + c.epoch;
-
-                    info.appendChild(name);
-                    info.appendChild(epoch);
-
-                    var badge = document.createElement("span");
-                    badge.className = "badge";
-                    if (c.state === "LEADER") { badge.className += " badge-leader"; badge.textContent = "LEADER"; }
-                    else if (c.state === "FOLLOWER") { badge.className += " badge-follower"; badge.textContent = "FOLLOWER"; }
-                    else if (c.state === "CANDIDATE") { badge.className += " badge-candidate"; badge.textContent = "CANDIDATE"; }
-                    else { badge.className += " badge-dead"; badge.textContent = "DEAD"; }
-
-                    row.appendChild(icon);
-                    row.appendChild(info);
-                    row.appendChild(badge);
-                    container.appendChild(row);
-                }
-
-                var banner = document.getElementById("election-banner");
-                if (!hasLeader && coords.length > 0) {
-                    banner.className = "election-banner visible";
-                } else {
-                    banner.className = "election-banner";
-                }
-            }
-
-            function updateWorkers(d) {
-                var container = document.getElementById("worker-grid");
-                var workers = d.workers || [];
-
-                // Reuse or create cards
-                while (container.children.length > workers.length) {
-                    container.removeChild(container.lastChild);
-                }
-
-                for (var i = 0; i < workers.length; i++) {
-                    var w = workers[i];
-                    var card = container.children[i];
-                    var isNew = false;
-
-                    if (!card) {
-                        card = document.createElement("div");
-                        card.className = "worker-card";
-                        container.appendChild(card);
-                        isNew = true;
+            ws.onmessage = (e) => {
+                try {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'snapshot' && msg.data) {
+                        updateDashboard(msg.data);
                     }
+                } catch (err) {}
+            };
 
-                    // Clear card
-                    while (card.firstChild) card.removeChild(card.firstChild);
+            ws.onclose = () => {
+                document.getElementById('status-pill').className = 'status-pill status-disconnected';
+                document.getElementById('status-pill').textContent = 'Disconnected';
+                setTimeout(connect, 3000);
+            };
+        }
 
-                    card.className = "worker-card" + (!w.alive ? " dead-border" : "");
+        let prevQueue = 0;
+        let prevAppends = 0;
 
-                    var nameEl = document.createElement("div");
-                    nameEl.className = "worker-name";
-                    nameEl.textContent = w.worker_id;
+        function updateDashboard(d) {
+            // Stats Bar
+            document.getElementById('stat-tps').textContent = d.throughput_per_min.toFixed(1);
+            document.getElementById('stat-queue').textContent = d.queue_depth;
+            if (d.payment_log) {
+                document.getElementById('stat-log').textContent = d.payment_log.appends || 0;
+                document.getElementById('stat-idempotency').textContent = d.payment_log.idempotency_hits || 0;
+                
+                // 2PC Stats
+                document.getElementById('2pc-prep').textContent = d.payment_log.two_pc_prepared || 0;
+                document.getElementById('2pc-com').textContent = d.payment_log.two_pc_committed || 0;
+                document.getElementById('2pc-roll').textContent = d.payment_log.two_pc_rolledback || 0;
 
-                    var badgeEl = document.createElement("div");
-                    badgeEl.className = "worker-badge";
-                    var badgeSpan = document.createElement("span");
-                    badgeSpan.className = "badge " + (w.alive ? "badge-alive" : "badge-worker-dead");
-                    badgeSpan.textContent = w.alive ? "ALIVE" : "DEAD";
-                    badgeEl.appendChild(badgeSpan);
-
-                    var tasksEl = document.createElement("div");
-                    tasksEl.className = "worker-stat";
-                    tasksEl.textContent = w.alive ? (w.tasks_done + " done") : "\u2014";
-
-                    var p99El = document.createElement("div");
-                    p99El.className = "worker-stat";
-                    p99El.textContent = w.alive && w.p99_ms > 0 ? ("p99: " + w.p99_ms.toFixed(0) + "ms") : "\u2014";
-
-                    var p50El = document.createElement("div");
-                    p50El.className = "worker-stat";
-                    p50El.textContent = w.alive && w.p50_ms > 0 ? ("p50: " + w.p50_ms.toFixed(0) + "ms") : "\u2014";
-
-                    var seenEl = document.createElement("div");
-                    seenEl.className = "worker-stat";
-                    seenEl.textContent = "seen " + Math.round(w.last_seen_secs || 0) + "s ago";
-
-                    card.appendChild(nameEl);
-                    card.appendChild(badgeEl);
-                    card.appendChild(tasksEl);
-                    card.appendChild(p99El);
-                    card.appendChild(p50El);
-                    card.appendChild(seenEl);
-
-                    // Flash effect on update
-                    if (!isNew) {
-                        var flashClass = w.alive ? "flash-alive" : "flash-dead";
-                        card.classList.add(flashClass);
-                        (function(c, fc) {
-                            setTimeout(function() { c.classList.remove(fc); }, 500);
-                        })(card, flashClass);
-                    }
+                // Event generation for queue and logs
+                if (d.payment_log.appends > prevAppends) {
+                    addEvent(`WAL Appended ${d.payment_log.appends - prevAppends} entries`, 'info');
+                    prevAppends = d.payment_log.appends;
                 }
             }
 
-            function updateQueue(d) {
-                var depth = d.queue_depth || 0;
-                var maxDisplay = 100;
-                var pct = Math.min((depth / maxDisplay) * 100, 100);
+            if (d.queue_depth > prevQueue + 5) {
+                addEvent(`Queue spiked to ${d.queue_depth}`, 'error');
+            }
+            prevQueue = d.queue_depth;
 
-                var fill = document.getElementById("queue-fill");
-                fill.style.width = pct + "%";
-
-                // Color thresholds
-                fill.className = "queue-bar-fill";
-                if (depth >= 60) fill.classList.add("queue-red");
-                else if (depth >= 20) fill.classList.add("queue-amber");
-                else fill.classList.add("queue-green");
-
-                var label = document.getElementById("queue-label");
-                if (depth === 0) {
-                    label.textContent = "Queue empty \u2713";
-                } else {
-                    label.textContent = depth + " tasks queued";
-                }
+            // Pipeline Diagram Status
+            let hasLeader = false;
+            let aliveWorkers = 0;
+            
+            if (d.gateway && d.gateway.reachable) {
+                document.getElementById('node-gw').className = 'node-circle active';
+            } else {
+                document.getElementById('node-gw').className = 'node-circle down';
             }
 
-            function updateThroughput(d) {
-                var val = d.throughput_per_min || 0;
-                throughputHistory.push(val);
-                if (throughputHistory.length > MAX_HISTORY) {
-                    throughputHistory.shift();
-                }
-
-                // Find max for normalization
-                var maxVal = 1;
-                for (var i = 0; i < throughputHistory.length; i++) {
-                    if (throughputHistory[i] > maxVal) maxVal = throughputHistory[i];
-                }
-
-                var container = document.getElementById("spark-container");
-                // Ensure we have exactly MAX_HISTORY bars
-                while (container.children.length > MAX_HISTORY) {
-                    container.removeChild(container.firstChild);
-                }
-                while (container.children.length < MAX_HISTORY) {
-                    var bar = document.createElement("div");
-                    bar.className = "spark-bar";
-                    bar.style.height = "2px";
-                    container.appendChild(bar);
-                }
-
-                // Update bar heights
-                var startIdx = MAX_HISTORY - throughputHistory.length;
-                for (var j = 0; j < MAX_HISTORY; j++) {
-                    var barEl = container.children[j];
-                    if (j < startIdx) {
-                        barEl.style.height = "2px";
-                    } else {
-                        var dataIdx = j - startIdx;
-                        var h = Math.max(2, (throughputHistory[dataIdx] / maxVal) * 58);
-                        barEl.style.height = h + "px";
-                    }
-                }
-
-                var valueEl = document.getElementById("throughput-value");
-                valueEl.textContent = val.toFixed(1);
+            if (d.payment_log && d.payment_log.reachable) {
+                document.getElementById('node-log').className = 'node-circle active';
+            } else {
+                document.getElementById('node-log').className = 'node-circle down';
             }
 
-            connect();
-        })();
+            // Coordinators List
+            const coordList = document.getElementById('coord-list');
+            coordList.innerHTML = '';
+            (d.coordinators || []).forEach(c => {
+                if (c.state === 'LEADER') hasLeader = true;
+                const badgeClass = c.state === 'LEADER' ? 'badge-leader' : c.state === 'DEAD' ? 'badge-dead' : 'badge-follower';
+                coordList.innerHTML += `
+                    <div class="node-item" style="${c.state === 'DEAD' ? 'opacity:0.5' : ''}">
+                        <span>${c.node_id}</span>
+                        <span class="badge ${badgeClass}">${c.state}</span>
+                    </div>
+                `;
+            });
+
+            document.getElementById('node-coord').className = hasLeader ? 'node-circle active' : 'node-circle down';
+
+            // Workers List
+            const workerList = document.getElementById('worker-list');
+            workerList.innerHTML = '';
+            (d.workers || []).forEach(w => {
+                if (w.alive && w.reachable) aliveWorkers++;
+                const badgeClass = (w.alive && w.reachable) ? 'badge-alive' : 'badge-dead';
+                const status = (w.alive && w.reachable) ? 'ALIVE' : 'DEAD';
+                workerList.innerHTML += `
+                    <div class="node-item" style="${status === 'DEAD' ? 'opacity:0.5' : ''}">
+                        <span>${w.worker_id}</span>
+                        <span class="badge ${badgeClass}">${status}</span>
+                    </div>
+                `;
+            });
+
+            document.getElementById('node-worker').className = aliveWorkers > 0 ? 'node-circle active' : 'node-circle down';
+        }
+
+        connect();
     </script>
 </body>
 </html>

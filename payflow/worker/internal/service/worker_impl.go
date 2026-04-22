@@ -362,9 +362,10 @@ func (w *WorkerServiceImpl) safeReportResult(
 		}
 		// Convert domain result to proto for outbox storage
 		pbResult := &pb.TaskResult{
-			TaskId:   result.TaskID,
-			WorkerId: result.WorkerID,
-			Epoch:    w.epoch,
+			TaskId:         result.TaskID,
+			WorkerId:       result.WorkerID,
+			Epoch:          w.epoch,
+			IdempotencyKey: result.IdempotencyKey,
 		}
 		if result.Status == domain.TaskStatusSuccess {
 			pbResult.Status = &pb.TaskResult_Success{Success: true}

@@ -80,6 +80,11 @@ func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
 			time.Sleep(backoff)
 		}
 
+		if req.GetBody != nil {
+			body, _ := req.GetBody()
+			req.Body = body
+		}
+
 		resp, err = c.httpClient.Do(req)
 		if err != nil {
 			continue

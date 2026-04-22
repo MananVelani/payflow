@@ -25,8 +25,8 @@ func main() {
 	var totalLatency time.Duration
 	var mu sync.Mutex
 
-	totalRequests := 100
-	concurrency := 20
+	totalRequests := 1000
+	concurrency := 50
 	
 	log.Printf("Bombarding Gateway with %d concurrent payments (Total: %d)...\n", concurrency, totalRequests)
 	
