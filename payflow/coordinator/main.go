@@ -1,0 +1,966 @@
+// Package main implements a canonical placeholder HTTP server for PayFlow services.
+// Members 1–4 copy this into their service directories and replace with real code in Weeks 2–3.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	coordPb "payflow/proto/coordinator"
+	logPb "payflow/proto/log"
+	paymentPb "payflow/proto/payment"
+	workerPb "payflow/proto/worker"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
+)
+
+// ── Prometheus Metrics ──────────────────────────────────────────────────────
+var (
+	metricElections = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "payflow_coordinator_elections_total",
+		Help: "Total number of leader elections triggered by this node.",
+	})
+	metricEpoch = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_epoch",
+		Help: "Current epoch number of this coordinator node.",
+	})
+	metricQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_queue_depth",
+		Help: "Current number of tasks in the in-memory task queue.",
+	})
+	metricIsLeader = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_is_leader",
+		Help: "1 if this node is currently the LEADER, 0 otherwise.",
+	})
+	metricWorkerCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "payflow_coordinator_live_workers",
+		Help: "Number of workers that sent a heartbeat in the last 10 seconds.",
+	})
+	metricTasksQueued = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "payflow_coordinator_tasks_queued_total",
+		Help: "Total number of payment tasks accepted and queued.",
+	})
+)
+
+// Hardcoded cluster addresses for local IPv4 testing
+var clusterPeers = map[string]string{
+	"coordinator-1": "127.0.0.1:50051",
+	"coordinator-2": "127.0.0.1:50052",
+	"coordinator-3": "127.0.0.1:50053",
+}
+
+func parsePeerMapFromEnv() map[string]string {
+	raw := strings.TrimSpace(os.Getenv("PEERS"))
+	if raw == "" {
+		return clusterPeers
+	}
+
+	peerMap := make(map[string]string)
+	parts := strings.Split(raw, ",")
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		host := strings.Split(addr, ":")[0]
+		peerMap[host] = addr
+	}
+
+	if len(peerMap) == 0 {
+		return clusterPeers
+	}
+
+	return peerMap
+}
+
+// CoordinatorNode implements all 3 required server interfaces
+type CoordinatorNode struct {
+	coordPb.UnimplementedCoordinatorClusterServer
+	paymentPb.UnimplementedPaymentGatewayServer
+	workerPb.UnimplementedWorkerManagementServer
+
+	ID      string
+	State   string
+	Epoch   int64
+	Workers map[string]time.Time
+
+	leaderTimeout time.Duration
+	resetTimer    chan bool
+
+	TaskQueue chan *workerPb.TaskAssignment
+	InFlight  map[string]*workerPb.TaskAssignment
+
+	mu sync.Mutex
+
+	c4Client    logPb.PaymentLogServiceClient
+	peerClients map[string]coordPb.CoordinatorClusterClient // NEW: The connection pool
+}
+
+// ---------------------------------------------------------
+// 1. COORDINATOR CLUSTER SERVICE (Bully Algorithm)
+// ---------------------------------------------------------
+
+func parseNodeID(id string) int {
+	parts := strings.Split(id, "-")
+	if len(parts) == 2 {
+		num, err := strconv.Atoi(parts[1])
+		if err == nil {
+			return num
+		}
+	}
+	return 0 // Fallback if parsing fails
+}
+
+func (c *CoordinatorNode) Election(ctx context.Context, req *coordPb.ElectionMessage) (*coordPb.ElectionResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Received ELECTION from %s (Req Epoch: %d)", c.ID, c.State, c.Epoch, req.CandidateId, req.Epoch)
+
+	// CRITICAL FIX 1: Ignore stale election requests from older epochs
+	if req.Epoch < c.Epoch {
+		log.Printf("[DEBUG-TRACE] Node %s | REJECTED %s (Stale Epoch %d < %d)", c.ID, req.CandidateId, req.Epoch, c.Epoch)
+		return &coordPb.ElectionResponse{
+			Epoch: c.Epoch,
+			Ok:    false, // Do not agree to the election!
+		}, nil
+	}
+
+	// CRITICAL FIX 2: Mathematical ID comparison instead of string comparison
+	myID := parseNodeID(c.ID)
+	candidateID := parseNodeID(req.CandidateId)
+
+	if req.Epoch > c.Epoch {
+		log.Printf("[DEBUG-TRACE] Node %s | ADOPTING HIGHER EPOCH: %d -> %d", c.ID, c.Epoch, req.Epoch)
+		c.Epoch = req.Epoch
+		if candidateID > myID {
+			log.Printf("[DEBUG-TRACE] Node %s | Challenger %s is stronger. Stepping down to FOLLOWER.", c.ID, req.CandidateId)
+			c.State = "FOLLOWER"
+		} else {
+			log.Printf("[DEBUG-TRACE] Node %s | Challenger %s is WEAKER. Remaining %s.", c.ID, req.CandidateId, c.State)
+		}
+	}
+
+	if candidateID < myID {
+		log.Printf("[DEBUG-TRACE] Node %s | FIGHTING BACK against weaker node %s. Triggering my own election.", c.ID, req.CandidateId)
+		go c.triggerElection() // Step down and start our own election to crush them
+	}
+
+	return &coordPb.ElectionResponse{
+		Epoch: c.Epoch,
+		Ok:    true,
+	}, nil
+}
+
+// AnnounceCoordinator handles the COORDINATOR victory message from a higher node
+func (c *CoordinatorNode) AnnounceCoordinator(ctx context.Context, req *coordPb.CoordinatorMessage) (*coordPb.AckResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if req.Epoch < c.Epoch {
+		log.Printf("[Node %s] Ignoring stale COORDINATOR announcement from %s (Epoch %d < %d)", c.ID, req.LeaderId, req.Epoch, c.Epoch)
+		return &coordPb.AckResponse{
+			Acknowledged: false,
+		}, nil
+	}
+
+	if req.Epoch > c.Epoch {
+		c.Epoch = req.Epoch
+		log.Printf(("[Node %s] Acknowledging Leader %s for Epoch %d"), c.ID, req.LeaderId, req.Epoch)
+		if c.State == "LEADER" {
+			c.State = "FOLLOWER"
+		}
+	}
+
+	myId := parseNodeID(c.ID)
+	leaderId := parseNodeID(req.LeaderId)
+
+	if leaderId < myId {
+		log.Printf("[Node %s] Rejecting leader %s (lower ID). Initiating election...", c.ID, req.LeaderId)
+		// We launch this in a goroutine so we don't block the current request
+		go c.triggerElection()
+
+		return &coordPb.AckResponse{
+			Acknowledged: false,
+		}, nil
+	}
+
+	// Step down and accept the new leader
+	c.State = "FOLLOWER"
+
+	// Reset the timeout timer so we don't accidentally trigger another election
+	// (The non-blocking channel send we built earlier!)
+	select {
+	case c.resetTimer <- true:
+	default:
+	}
+
+	return &coordPb.AckResponse{
+		Acknowledged: true,
+	}, nil
+}
+
+// ---------------------------------------------------------
+// 2. PAYMENT GATEWAY SERVICE (From C1 Gateway)
+// ---------------------------------------------------------
+
+func (c *CoordinatorNode) SubmitTask(ctx context.Context, req *paymentPb.SubmitTaskRequest) (*paymentPb.SubmitTaskResponse, error) {
+	c.mu.Lock()
+	isLeader := c.State == "LEADER"
+	c.mu.Unlock()
+
+	// 1. Only the LEADER is allowed to accept new tasks
+	if !isLeader {
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader. please route to the current leader", c.ID)
+	}
+
+	log.Printf("[LEADER %s] Received task for amount: %f", c.ID, req.Amount)
+
+	if len(c.TaskQueue) >= cap(c.TaskQueue) {
+		log.Printf("[LEADER %s] TaskQueue at capacity. Rejecting request.", c.ID)
+		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, please try again")
+	}
+
+	// 2. Generate a dynamic Transaction ID (CRITICAL FIX: UUID prevents collisions)
+	txnID := "txn-" + uuid.New().String()
+
+	payloadMap := map[string]interface{}{
+		"amount":          req.Amount,
+		"currency":        req.Currency,
+		"merchant_id":     req.MerchantId,
+		"idempotency_key": req.IdempotencyKey,
+	}
+	payloadBytes, err := json.Marshal(payloadMap) // Automatically escapes bad characters
+	if err != nil {
+		log.Printf("[LEADER %s] JSON Marshal failed: %v", c.ID, err)
+		return nil, status.Errorf(codes.Internal, "failed to encode task payload")
+	}
+	safePayload := string(payloadBytes)
+
+	// 3. --- FORWARD TO C4 (Payment Log Service) ---
+	if c.c4Client == nil {
+		return nil, status.Errorf(codes.Internal, "internal server error: C4 client not initialized")
+	}
+
+	logRes, err := c.c4Client.AppendEntry(ctx, &logPb.LogEntry{
+		Epoch:   c.Epoch,
+		TxnId:   txnID,
+		State:   "QUEUED",
+		Payload: safePayload,
+	})
+
+	if err != nil {
+		// It is safe to return an error here because nothing was written to the WAL.
+		return nil, status.Errorf(codes.Unavailable, "failed to persist task to WAL: %v", err)
+	}
+
+	log.Printf("[LEADER %s] Successfully wrote to C4 log! Index: %d", c.ID, logRes.LogIndex)
+
+	// 4. --- PUSH TO WORKER QUEUE (Bounded) ---
+	newTask := &workerPb.TaskAssignment{
+		Epoch:          c.Epoch,
+		TaskId:         txnID,
+		IdempotencyKey: req.IdempotencyKey,
+		Amount:         req.Amount,
+		Currency:       req.Currency,
+		MerchantId:     req.MerchantId,
+	}
+
+	// POINT 3 FIX: Use a select statement with a strict timeout instead of an unbounded goroutine.
+	select {
+	case c.TaskQueue <- newTask:
+		// Success! The queue had space.
+		metricTasksQueued.Inc()  // ← Prometheus: count accepted tasks
+		log.Printf("[LEADER %s] Task %s enqueued. Queue size: %d", c.ID, txnID, len(c.TaskQueue))
+		return &paymentPb.SubmitTaskResponse{
+			TxnId: txnID,
+			Result: &paymentPb.SubmitTaskResponse_Success{
+				Success: true,
+			},
+		}, nil
+	case <-time.After(1 * time.Second):
+		// The queue filled up during the split-second we were writing to the database.
+		// We drop the memory operation to prevent a goroutine leak.
+		// The task is safe in the C4 WAL and will be recovered on the next leader election.
+		log.Printf("[LEADER %s] CRITICAL: Queue blocked. Task %s stranded in WAL.", c.ID, txnID)
+		return nil, status.Errorf(codes.ResourceExhausted, "system is under heavy load, task %s recorded but delayed", txnID)
+	}
+}
+
+// ---------------------------------------------------------
+// 3. WORKER MANAGEMENT SERVICE (From C3 Workers)
+// ---------------------------------------------------------
+
+func (c *CoordinatorNode) RegisterWorker(ctx context.Context, req *workerPb.RegisterRequest) (*workerPb.RegisterResponse, error) {
+	c.mu.Lock()
+	isLeader := c.State == "LEADER"
+	c.mu.Unlock()
+
+	if !isLeader {
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader. cannot register workers", c.ID)
+	}
+
+	c.mu.Lock()
+	c.Workers[req.WorkerId] = time.Now()
+	c.mu.Unlock()
+
+	log.Printf("[LEADER %s] Registered worker: %s", c.ID, req.WorkerId)
+	return &workerPb.RegisterResponse{Success: true}, nil
+}
+
+// Heartbeat receives periodic health checks from workers
+func (c *CoordinatorNode) Heartbeat(ctx context.Context, req *workerPb.HeartbeatRequest) (*workerPb.HeartbeatResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.State == "LEADER" {
+		_, exists := c.Workers[req.WorkerId]
+		if !exists {
+			log.Printf("[LEADER %s] New worker joined the pool: %s", c.ID, req.WorkerId)
+		}
+		c.Workers[req.WorkerId] = time.Now() // Update last seen timestamp
+	}
+
+	return &workerPb.HeartbeatResponse{
+		Acknowledged: true,
+	}, nil
+}
+
+// startLeaderHeartbeat continuously suppresses follower elections
+func (c *CoordinatorNode) startLeaderHeartbeat() {
+	c.mu.Lock()
+	startingEpoch := c.Epoch
+	c.mu.Unlock()
+
+	log.Printf("[LEADER %s] Starting dedicated per-peer heartbeat tickers...", c.ID)
+
+	for peerID, client := range c.peerClients {
+		// Spawn exactly ONE long-lived goroutine per peer
+		go func(pID string, cli coordPb.CoordinatorClusterClient) {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				c.mu.Lock()
+				state := c.State
+				curEpoch := c.Epoch
+				c.mu.Unlock()
+
+				// If we step down, this specific peer's goroutine quietly exits
+				if state != "LEADER" || curEpoch != startingEpoch {
+					return 
+				}
+
+				// Strict 1-second timeout prevents overlapping network hangs
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				_, err := cli.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
+					Epoch:    curEpoch,
+					LeaderId: c.ID,
+				})
+				cancel() // Always cancel context after the call
+
+				if err != nil {
+					// Peer is down, but we don't leak goroutines waiting for them
+				}
+			}
+		}(peerID, client)
+	}
+}
+
+// ReportResult handles the outcome of a payment from a worker
+func (c *CoordinatorNode) ReportResult(ctx context.Context, req *workerPb.TaskResult) (*workerPb.ResultAck, error) {
+	c.mu.Lock()
+	isLeader := c.State == "LEADER"
+	if !isLeader {
+		c.mu.Unlock()
+		return nil, status.Errorf(codes.FailedPrecondition, "node %s is not the leader", c.ID)
+	}
+
+	delete(c.InFlight, req.WorkerId) // Remove from in-flight tracking immediately to prevent double-processing
+	c.mu.Unlock()
+
+	log.Printf("[LEADER %s] Processing task result for %s from worker %s", c.ID, req.TaskId, req.WorkerId)
+
+	// 1. Determine if the worker succeeded or failed
+	isSuccess := req.GetSuccess()
+	if !isSuccess {
+		log.Printf("[LEADER %s] Worker %s failed task %s. Error: %s", c.ID, req.WorkerId, req.TaskId, req.GetErrorMessage())
+	} else {
+		log.Printf("[LEADER %s] Worker %s successfully completed task %s", c.ID, req.WorkerId, req.TaskId)
+	}
+
+	// 2. --- FORWARD RESULT TO C4 (Payment Log Service) ---
+	// FIX: Removed the Dial/NewClient block to prevent connection exhaustion
+	if c.c4Client != nil {
+		_, err := c.c4Client.WriteResult(ctx, &logPb.WriteResultRequest{
+			TxnId:          req.TaskId,
+			Success:        isSuccess,
+			IdempotencyKey: req.GetIdempotencyKey(),
+		})
+
+		if err != nil {
+			log.Printf("[LEADER %s] C4 WriteResult failed for task %s: %v", c.ID, req.TaskId, err)
+		} else {
+			log.Printf("[LEADER %s] Permanently recorded task %s outcome to C4.", c.ID, req.TaskId)
+		}
+	} else {
+		log.Printf("[LEADER %s] Skip C4 update: Persistent client is nil", c.ID)
+	}
+
+	c.mu.Lock()
+	delete(c.InFlight, req.WorkerId)
+	c.mu.Unlock()
+
+	// 3. Acknowledge the worker
+	return &workerPb.ResultAck{
+		Acknowledged: true,
+	}, nil
+}
+
+// PollTasks is a SERVER STREAMING endpoint where the coordinator pushes tasks to the worker
+func (c *CoordinatorNode) PollTasks(req *workerPb.PollRequest, stream workerPb.WorkerManagement_PollTasksServer) error {
+	c.mu.Lock()
+	isLeader := c.State == "LEADER"
+	c.mu.Unlock()
+
+	if !isLeader {
+		return status.Errorf(codes.FailedPrecondition, "node %s is not the leader. stream rejected", c.ID)
+	}
+
+	log.Printf("[LEADER %s] Worker %s started polling for tasks", c.ID, req.WorkerId)
+
+	// Listen for either a new task or the client disconnecting
+	for {
+		select {
+		case <-stream.Context().Done():
+			// The worker closed the connection or timed out.
+			// Exit the goroutine cleanly!
+			log.Printf("[LEADER %s] Worker %s disconnected. Closing stream.", c.ID, req.WorkerId)
+			return nil
+
+		case task := <-c.TaskQueue:
+			log.Printf("[LEADER %s] Dispatching task %s to worker %s", c.ID, task.TaskId, req.WorkerId)
+
+			err := stream.Send(task)
+			if err != nil {
+				log.Printf("[LEADER %s] Failed to send task %s to worker %s: %v", c.ID, task.TaskId, req.WorkerId, err)
+
+				// Re-enqueue the task safely
+				select {
+				case c.TaskQueue <- task:
+					log.Printf("[LEADER %s] Successfully re-enqueued task %s", c.ID, task.TaskId)
+				default:
+					log.Printf("[LEADER %s] CRITICAL: Queue full! Dropped re-enqueued task %s", c.ID, task.TaskId)
+				}
+				return err
+			}
+			c.mu.Lock()
+			c.InFlight[req.WorkerId] = task
+			c.mu.Unlock()
+		}
+	}
+}
+
+// // StartLeaderMonitor runs continuously in the background.
+// func (c *CoordinatorNode) StartLeaderMonitor() {
+// 	// The 'go' keyword spins this off into its own concurrent thread
+// 	go func() {
+// 		timer := time.NewTimer(c.leaderTimeout)
+// 		for {
+// 			select {
+// 			case <-timer.C:
+// 				// The timer hit 0. The leader is presumed DEAD.
+// 				c.triggerElection()
+
+// 				// Reset the timer so we don't spam elections endlessly
+// 				timer.Reset(c.leaderTimeout)
+
+// 			case <-c.resetTimer:
+// 				// We got a ping from the leader! Reset the countdown.
+// 				if !timer.Stop() {
+// 					// Drain the channel to prevent memory leaks if it already fired
+// 					select {
+// 					case <-timer.C:
+// 					default:
+// 					}
+// 				}
+// 				timer.Reset(c.leaderTimeout)
+// 			}
+// 		}
+// 	}()
+// }
+
+// StartLeaderMonitor checks if the leader has sent a heartbeat recently
+func (c *CoordinatorNode) StartLeaderMonitor() {
+	go func() {
+		for {
+			c.mu.Lock()
+			currentState := c.State
+			currentEpoch := c.Epoch
+			c.mu.Unlock()
+
+			// Only FOLLOWERs and CANDIDATEs should be monitoring for leader timeouts.
+			// If we are LEADER, just idle — the heartbeat sender is our job now.
+			if currentState == "LEADER" {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			select {
+			case <-time.After(c.leaderTimeout):
+				// Double-check the epoch hasn't advanced while we were waiting.
+				// A stale goroutine from a superseded election round must exit here.
+				c.mu.Lock()
+				epochNow := c.Epoch
+				c.mu.Unlock()
+				if epochNow != currentEpoch {
+					log.Printf("[DEBUG-TRACE] Node %s | Stale monitor goroutine (Epoch %d) exiting — current Epoch is %d", c.ID, currentEpoch, epochNow)
+					return
+				}
+				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | TIMER FIRED! No heartbeat received.", c.ID, currentState, currentEpoch)
+				c.triggerElection()
+				// Sleep through the election resolution window so we don't
+				// immediately re-arm and fire another spurious election.
+				time.Sleep(c.leaderTimeout)
+			case <-c.resetTimer:
+				// Timer was successfully reset by a heartbeat
+				log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Timer reset successfully.", c.ID, currentState, currentEpoch)
+			}
+		}
+	}()
+}
+
+// triggerElection safely updates the state and prepares to fight for leadership
+func (c *CoordinatorNode) triggerElection() {
+	c.mu.Lock()
+
+	// If we are already the leader, we don't need to overthrow ourselves
+	if c.State == "LEADER" || c.State == "CANDIDATE" {
+		log.Printf("[DEBUG-TRACE] Node %s | State: %s | Epoch: %d | Election trigger ignored", c.ID, c.State, c.Epoch)
+		c.mu.Unlock()
+		return
+	}
+
+	oldState := c.State
+	// Transition to CANDIDATE and increment our Epoch
+	c.State = "CANDIDATE"
+	c.Epoch++
+	c.persistEpochToC4(c.Epoch)
+
+	currentEpoch := c.Epoch // Capture the epoch for logging before we release the lock
+	c.mu.Unlock()
+
+	metricElections.Inc()                         // ← Prometheus: count every election
+	metricIsLeader.Set(0)                         // ← Not leader while candidate
+	metricEpoch.Set(float64(currentEpoch))        // ← Update epoch gauge
+
+	log.Printf("[DEBUG-TRACE] Node %s | STATE MUTATION: %s -> CANDIDATE | Epoch escalated to %d", c.ID, oldState, currentEpoch)
+	go c.broadcastElection()
+}
+
+// broadcastElection sends an ELECTION message to all nodes with a higher ID
+func (c *CoordinatorNode) broadcastElection() {
+	// 1. Data Race Fix: Capture the epoch safely before spawning any network calls
+	c.mu.Lock()
+	currentEpoch := c.Epoch
+	c.mu.Unlock()
+
+	higherClients := make(map[string]coordPb.CoordinatorClusterClient)
+	myNumericID := parseNodeID(c.ID)
+
+	// 2. Connection Pool Fix: Filter our existing, persistent connections
+	// instead of using raw IP strings
+	for id, client := range c.peerClients {
+		peerNumericID := parseNodeID(id)
+		if peerNumericID > myNumericID {
+			higherClients[id] = client
+		}
+	}
+
+	// 3. Base Case: If there are no higher nodes, we win instantly!
+	if len(higherClients) == 0 {
+		log.Printf("[Node %s] possessing highest ID, election won!", c.ID)
+		c.becomeLeader()
+		return
+	}
+
+	log.Printf("[Node %s] Broadcasting ELECTION to %d higher nodes...", c.ID, len(higherClients))
+
+	// 4. Concurrent RPC calls using a Go channel to collect responses
+	responses := make(chan bool, len(higherClients))
+
+	for id, client := range higherClients {
+		// Pass the pre-warmed client into the goroutine!
+		go func(peerID string, cli coordPb.CoordinatorClusterClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			// No more grpc.NewClient() here! We just use the 'cli' passed in.
+			res, err := cli.Election(ctx, &coordPb.ElectionMessage{
+				Epoch:       currentEpoch, // Using the safely captured epoch
+				CandidateId: c.ID,
+			})
+
+			// If the RPC succeeded and the node said OK
+			if err == nil && res.Ok {
+				log.Printf("[Node %s] Received OK from higher node: %s", c.ID, peerID)
+				responses <- true
+			} else {
+				responses <- false
+			}
+		}(id, client)
+	}
+
+	// 5. Wait for all responses
+	gotOk := false
+	for i := 0; i < len(higherClients); i++ {
+		if <-responses {
+			gotOk = true // Someone higher is alive!
+		}
+	}
+
+	// 6. Evaluate the Election Results
+	if !gotOk {
+		log.Printf("[Node %s] No higher nodes responded OK. Claiming leadership...", c.ID)
+		// Use the new safeguard instead of blindly calling c.becomeLeader()
+		c.checkAndBecomeLeader(currentEpoch)
+	} else {
+		log.Printf("[Node %s] A higher node is alive. Stepping down to FOLLOWER.", c.ID)
+		c.mu.Lock()
+		// Only step down if we haven't already moved on to a higher epoch
+		if c.Epoch == currentEpoch {
+			c.State = "FOLLOWER"
+		}
+		c.mu.Unlock()
+	}
+}
+
+// broadcastCoordinator tells all other nodes to bend the knee
+func (c *CoordinatorNode) broadcastCoordinator() {
+	// Safely grab the epoch to prevent data races during the broadcast
+	c.mu.Lock()
+	currentEpoch := c.Epoch
+	c.mu.Unlock()
+
+	for peerID, client := range c.peerClients {
+		// Fire off a concurrent gRPC call to each peer
+		go func(pID string, cli coordPb.CoordinatorClusterClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			_, err := cli.AnnounceCoordinator(ctx, &coordPb.CoordinatorMessage{
+				Epoch:    currentEpoch,
+				LeaderId: c.ID,
+			})
+			if err != nil {
+				return // Peer is likely down, which is fine
+			}
+		}(peerID, client)
+	}
+}
+
+// startWorkerMonitor sweeps the worker pool to detect crashed containers
+func (c *CoordinatorNode) startWorkerMonitor() {
+	c.mu.Lock()
+	startingEpoch := c.Epoch
+	c.mu.Unlock()
+
+	log.Printf("[LEADER %s] Starting worker heartbeat monitor...", c.ID)
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.mu.Lock()
+
+		if c.State != "LEADER" || c.Epoch != startingEpoch {
+			log.Printf("[Node %s] Stepped down or epoch changed. Stopping worker monitor for Epoch %d.", c.ID, startingEpoch)
+			c.mu.Unlock()
+			return
+		}
+
+		now := time.Now()
+		for workerID, lastSeen := range c.Workers {
+			// If it has been more than 6 seconds since their last ping...
+			if now.Sub(lastSeen) > 6*time.Second {
+				log.Printf("[LEADER %s] Worker %s timeout (missed 3 heartbeats). Marking as DEAD.", c.ID, workerID)
+
+				delete(c.Workers, workerID)
+
+				if strandedTask, exists := c.InFlight[workerID]; exists {
+					log.Printf("[LEADER %s] Reassigning incomplete task %s from dead worker %s", c.ID, strandedTask.TaskId, workerID)
+					delete(c.InFlight, workerID)
+
+					// Push back to the queue in a goroutine to avoid blocking the monitor.
+					// Use a non-blocking send so this goroutine cannot block indefinitely
+					// if the task queue is full.
+					go func(t *workerPb.TaskAssignment) {
+						select {
+						case c.TaskQueue <- t:
+							// Successfully re-enqueued stranded task.
+						default:
+							log.Printf("[LEADER %s] Failed to re-enqueue stranded task %s: task queue is full", c.ID, t.TaskId)
+						}
+					}(strandedTask)
+				}
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// rebuildQueueFromC4 queries the persistent log for stranded tasks and re-enqueues them.
+func (c *CoordinatorNode) rebuildQueueFromC4() {
+	if c.c4Client == nil {
+		log.Printf("[LEADER %s] Cannot rebuild queue: C4 persistent client is nil", c.ID)
+		return
+	}
+
+	log.Printf("[LEADER %s] Initiating WAL recovery from C4...", c.ID)
+
+	// Give the database 10 seconds to respond with the pending records
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := c.c4Client.GetAllPending(ctx, &logPb.PendingRequest{
+		Epoch: c.Epoch,
+	})
+	if err != nil {
+		log.Printf("[LEADER %s] CRITICAL: Failed to fetch pending tasks from C4: %v", c.ID, err)
+		return
+	}
+
+	recoveredCount := 0
+
+	// 2. Process the stream of LogEntries one by one
+	for {
+		entry, err := stream.Recv()
+
+		if err == io.EOF {
+			// The database has finished sending all pending tasks
+			break
+		}
+		if err != nil {
+			log.Printf("[LEADER %s] Error reading from C4 recovery stream: %v", c.ID, err)
+			break
+		}
+
+		// 3. Unmarshal the JSON payload
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(entry.Payload), &payload); err != nil {
+			log.Printf("[LEADER %s] Failed to parse JSON payload for recovered task %s: %v", c.ID, entry.TxnId, err)
+			continue
+		}
+
+		// 4. Safely type-assert the fields extracted from the JSON map
+		amount, _ := payload["amount"].(float64)
+		currency, _ := payload["currency"].(string)
+		merchantID, _ := payload["merchant_id"].(string)
+		idempotencyKey, _ := payload["idempotency_key"].(string)
+
+		// 5. Reconstruct the TaskAssignment
+		recoveredTask := &workerPb.TaskAssignment{
+			Epoch:          c.Epoch, // Stamp it with the NEW leader's epoch
+			TaskId:         entry.TxnId,
+			Amount:         amount,
+			Currency:       currency,
+			MerchantId:     merchantID,
+			IdempotencyKey: idempotencyKey,
+		}
+
+		// 6. BLOCKING enqueue guarantees ZERO data loss.
+		// If the channel is full (100 items), this will pause until a worker connects and processes a task.
+		c.TaskQueue <- recoveredTask
+		recoveredCount++
+		log.Printf("[LEADER %s] Successfully re-enqueued stranded task %s", c.ID, recoveredTask.TaskId) // avoid task drop as planned
+	}
+
+	log.Printf("[LEADER %s] Recovery complete. Restored %d pending tasks from C4 WAL", c.ID, recoveredCount)
+}
+
+// checkAndBecomeLeader prevents stale goroutines from hijacking the cluster
+func (c *CoordinatorNode) checkAndBecomeLeader(electionEpoch int64) {
+	c.mu.Lock()
+	// CRITICAL FIX: If our epoch changed or we were forced to step down
+	// while waiting for the network, ABORT the takeover!
+	if c.State != "CANDIDATE" {
+		log.Printf("[Node %s] Election aborted. Current state: %s. Current Epoch: %d. Election Epoch: %d", c.ID, c.State, c.Epoch, electionEpoch)
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+
+	// We are still the valid candidate. Claim the throne!
+	c.becomeLeader()
+}
+
+// becomeLeader locks in the victory and changes the state
+func (c *CoordinatorNode) becomeLeader() {
+	c.mu.Lock()
+	c.State = "LEADER"
+	epoch := c.Epoch
+	c.mu.Unlock()
+
+	metricIsLeader.Set(1)                  // ← Prometheus: we are the leader
+	metricEpoch.Set(float64(epoch))        // ← Sync epoch gauge
+
+	c.broadcastCoordinator()
+
+	log.Printf("[LEADER %s] Successfully elected as LEADER. Operating in Epoch %d", c.ID, epoch)
+	go c.startLeaderHeartbeat()
+	go c.startWorkerMonitor()
+
+	go c.rebuildQueueFromC4() // Recovery Function
+}
+
+// recoverEpochFromC4 fetches the last known epoch from the Payment Log on startup.
+func (c *CoordinatorNode) recoverEpochFromC4() {
+	if c.c4Client == nil {
+		c.Epoch = 1
+		return
+	}
+	
+	res, err := c.c4Client.GetEpoch(context.Background(), &logPb.EmptyRequest{})
+	if err == nil {
+		c.Epoch = res.Epoch
+		log.Printf("[Node %s] Successfully recovered Epoch %d from C4", c.ID, c.Epoch)
+	}
+}
+
+// persistEpochToC4 saves the epoch to the database whenever it increments.
+func (c *CoordinatorNode) persistEpochToC4(newEpoch int64) {
+	if c.c4Client == nil { return }
+	
+	_, err := c.c4Client.SaveEpoch(context.Background(), &logPb.EpochRequest{Epoch: newEpoch})
+	if err != nil {
+		log.Printf("[Node %s] Error persisting epoch to C4: %v", c.ID, err)
+	}
+}
+
+func main() {
+	idFlag := flag.String("id", "coordinator-1", "The ID of the coordinator node")
+	portFlag := flag.String("port", ":50051", "The port to run the gRPC server on")
+	flag.Parse() // Parse the flags from the terminal
+
+	log.Printf("Booting up node %s... Connecting to C4 Database...", *idFlag)
+	var c4Client logPb.PaymentLogServiceClient // Declare variable
+	c4Addr := strings.TrimSpace(os.Getenv("PAYMENT_LOG_ADDR"))
+	if c4Addr == "" {
+		c4Addr = "payment-log:50054"
+	}
+
+	c4Conn, err := grpc.NewClient(c4Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	if err == nil {
+		defer c4Conn.Close()
+		c4Client = logPb.NewPaymentLogServiceClient(c4Conn)
+		log.Printf("Successfully connected to C4 Database!")
+	}
+
+	// Set up the persistent peer connection pool
+	peerAddrs := parsePeerMapFromEnv()
+	peerClients := make(map[string]coordPb.CoordinatorClusterClient)
+	for id, addr := range peerAddrs {
+		if id == *idFlag {
+			continue // Don't dial ourselves
+		}
+
+		// Note: grpc.NewClient doesn't block waiting for connection by default,
+		// so it's safe to do this even if peers aren't online yet.
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			defer conn.Close() // Ensure connections are cleaned up on shutdown
+			peerClients[id] = coordPb.NewCoordinatorClusterClient(conn)
+		}
+	}
+
+	node := &CoordinatorNode{
+		ID:            *idFlag,
+		State:         "FOLLOWER",
+		Epoch:         int64(0),
+		Workers:       make(map[string]time.Time),
+		leaderTimeout: 5 * time.Second,
+		resetTimer:    make(chan bool, 1),
+		TaskQueue:     make(chan *workerPb.TaskAssignment, 100),
+		InFlight:      make(map[string]*workerPb.TaskAssignment),
+		c4Client:      c4Client,
+		peerClients:   peerClients,
+	}
+
+	node.recoverEpochFromC4()
+
+	// Start Prometheus metrics HTTP server so C5 monitor can scrape live state
+	metricsPort := strings.TrimSpace(os.Getenv("METRICS_PORT"))
+	if metricsPort == "" {
+		metricsPort = "2112"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+		})
+		// Background goroutine: keep queue-depth and worker-count gauges fresh
+		go func() {
+			for range time.Tick(2 * time.Second) {
+				node.mu.Lock()
+				metricQueueDepth.Set(float64(len(node.TaskQueue)))
+				metricWorkerCount.Set(float64(len(node.Workers)))
+				metricEpoch.Set(float64(node.Epoch))
+				if node.State == "LEADER" {
+					metricIsLeader.Set(1)
+				} else {
+					metricIsLeader.Set(0)
+				}
+				node.mu.Unlock()
+			}
+		}()
+		log.Printf("[Node %s] Prometheus metrics server started on :%s", *idFlag, metricsPort)
+		if err := http.ListenAndServe(":"+metricsPort, mux); err != nil {
+			log.Printf("[Node %s] Metrics server error: %v", *idFlag, err)
+		}
+	}()
+
+	node.StartLeaderMonitor()
+
+	lis, err := net.Listen("tcp", *portFlag)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+
+	// Register all three services to the same physical gRPC server
+	coordPb.RegisterCoordinatorClusterServer(grpcServer, node)
+	paymentPb.RegisterPaymentGatewayServer(grpcServer, node)
+	workerPb.RegisterWorkerManagementServer(grpcServer, node)
+
+	reflection.Register(grpcServer)
+
+	log.Printf("Coordinator %s starting in %s state on port %s...", node.ID, node.State, *portFlag)
+
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
+	}
+}

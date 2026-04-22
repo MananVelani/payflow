@@ -1,22 +1,23 @@
-# Start from the official Go image
-FROM golang:1.22-alpine
+# C1 API Gateway Dockerfile
 
-# Set the working directory inside the container
-WORKDIR /app
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+RUN apk add --no-cache git
 
-# Copy the go.mod and go.sum files first (if you have them)
-# COPY go.mod go.sum ./
-# RUN go mod download
+COPY go.mod go.sum ./
+RUN go mod download
 
-# Copy the entire mono-repo context so the gateway can access the shared proto files
-COPY . .
+COPY proto ./proto
+COPY gateway ./gateway
 
-# Change to the gateway directory and build the binary
-WORKDIR /app/gateway
-RUN go build -o api-gateway main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /gateway ./gateway
 
-# Expose the REST and gRPC ports defined in the architecture map
-EXPOSE 8080 9090
-
-# Command to run the executable
-CMD ["./api-gateway"]
+FROM alpine:3.19 AS final
+RUN apk add --no-cache ca-certificates wget busybox-extras iproute2
+RUN adduser -D -u 1001 app
+COPY --from=builder /gateway /gateway
+USER app
+EXPOSE 8080 9090 2112
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD wget -qO- http://localhost:8080/health || exit 1
+ENTRYPOINT ["/gateway"]

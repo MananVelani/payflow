@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package payflow.log.v1;
+option go_package = "payflow/proto/log";
+
+// Dedicated gRPC service with BoltDB store
+service PaymentLogService {
+    // Append-only operations
+    rpc AppendEntry(LogEntry) returns (AppendResponse);
+    rpc GetEntry(GetEntryRequest) returns (LogEntry);
+    rpc GetLogRange(GetRangeRequest) returns (stream LogEntry);
+    rpc GetAllPending(PendingRequest) returns (stream LogEntry);
+    
+    // Idempotency deduplication
+    rpc CheckIdempotency(IdempotencyRequest) returns (IdempotencyResponse);
+    rpc WriteResult(WriteResultRequest) returns (WriteResultAck);
+
+    // 2-Phase Commit for High-Value Payments
+    rpc HandlePrepare(TxnRequest) returns (TxnResponse);
+    rpc HandleCommit(TxnRequest) returns (TxnResponse);
+    rpc HandleRollback(TxnRequest) returns (TxnResponse);
+    
+    // Epoch State Recovery
+    rpc GetEpoch(EmptyRequest) returns (EpochResponse);
+    rpc SaveEpoch(EpochRequest) returns (WriteResultAck);
+}
+
+message LogEntry {
+    int64 epoch = 1;
+    string txn_id = 2;
+    string state = 3;
+    string payload = 4;
+    
+    reserved 5 to 10;
+}
+
+message AppendResponse {
+    int64 log_index = 1;
+    bool success = 2;
+}
+
+message GetEntryRequest {
+    string txn_id = 1;
+}
+
+message GetRangeRequest {
+    int64 from_index = 1;
+    int64 to_index = 2;
+}
+
+message PendingRequest {
+    int64 epoch = 1;
+}
+
+message IdempotencyRequest {
+    string idempotency_key = 1;
+}
+
+message IdempotencyResponse {
+    bool exists = 1;
+    string txn_id = 2;
+    bool success = 3;
+}
+
+message WriteResultRequest {
+    string idempotency_key = 1;
+    string txn_id = 2;
+    bool success = 3;
+}
+
+message WriteResultAck {
+    bool acknowledged = 1;
+}
+
+message TxnRequest {
+    int64 epoch = 1;
+    string txn_id = 2;
+}
+
+message TxnResponse {
+    bool success = 1;
+}
+
+message EmptyRequest {}
+
+message EpochRequest {
+    int64 epoch = 1;
+}
+
+message EpochResponse {
+    int64 epoch = 1;
+}
