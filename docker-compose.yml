@@ -60,7 +60,7 @@ x-worker-base: &worker-base
 
 x-worker-env: &worker-env
   METRICS_PORT: "2112"
-  COORDINATOR_ADDR: "coordinator-1:50051"
+  COORDINATOR_ADDR: "coordinator-3:50053"
   LOG_SERVICE_ADDR: "payment-log:50054"
   HEARTBEAT_INTERVAL: "2s"
   BANK_API_ADDR: "http://mock-bank:9999"

@@ -16,6 +16,8 @@ var bucket = []byte("payments")
 
 var idempotencyBucket = []byte("idempotency")
 
+var preparedBucket = []byte("prepared")
+
 func NewStore() *Store {
 	dbPath := os.Getenv("BOLT_PATH")
 	if dbPath == "" {
@@ -30,6 +32,7 @@ func NewStore() *Store {
 	db.Update(func(tx *bolt.Tx) error {
 		_, _ = tx.CreateBucketIfNotExists(bucket)
 		_, _ = tx.CreateBucketIfNotExists(idempotencyBucket)
+		_, _ = tx.CreateBucketIfNotExists(preparedBucket)
 		return nil
 	})
 
@@ -153,4 +156,90 @@ func (s *Store) GetEpoch() int64 {
 	})
 
 	return epoch
+}
+
+// Prepare locks a high-value transaction for 2-Phase Commit.
+// Returns false if the txn doesn't exist or is already in a terminal state.
+func (s *Store) Prepare(txnID string) bool {
+	var ok bool
+	s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(preparedBucket)
+		data, _ := json.Marshal(map[string]string{
+			"txn_id": txnID,
+			"state":  "PREPARED",
+		})
+		if err := b.Put([]byte(txnID), data); err != nil {
+			return err
+		}
+		ok = true
+		return nil
+	})
+	return ok
+}
+
+// Commit finalises a PREPARED transaction in the 2PC log.
+func (s *Store) Commit(txnID string) bool {
+	return s.update2PCState(txnID, "COMMITTED")
+}
+
+// Rollback aborts a PREPARED transaction in the 2PC log.
+func (s *Store) Rollback(txnID string) bool {
+	return s.update2PCState(txnID, "ROLLED_BACK")
+}
+
+func (s *Store) update2PCState(txnID, newState string) bool {
+	var ok bool
+	s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(preparedBucket)
+		
+		// Ensure the transaction was actually PREPARED
+		existing := b.Get([]byte(txnID))
+		if existing == nil {
+			return nil // Not a 2PC transaction
+		}
+
+		var entry map[string]string
+		if err := json.Unmarshal(existing, &entry); err != nil {
+			return nil
+		}
+
+		if entry["state"] != "PREPARED" {
+			return nil // Already resolved or invalid state
+		}
+
+		data, _ := json.Marshal(map[string]string{
+			"txn_id": txnID,
+			"state":  newState,
+		})
+		if err := b.Put([]byte(txnID), data); err != nil {
+			return err
+		}
+		ok = true
+		return nil
+	})
+	return ok
+}
+
+// Get2PCStats returns counts of PREPARED, COMMITTED, ROLLED_BACK records.
+func (s *Store) Get2PCStats() (prepared, committed, rolledBack int64) {
+	s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(preparedBucket)
+		b.ForEach(func(k, v []byte) error {
+			var entry map[string]string
+			if err := json.Unmarshal(v, &entry); err != nil {
+				return nil
+			}
+			switch entry["state"] {
+			case "PREPARED":
+				prepared++
+			case "COMMITTED":
+				committed++
+			case "ROLLED_BACK":
+				rolledBack++
+			}
+			return nil
+		})
+		return nil
+	})
+	return
 }

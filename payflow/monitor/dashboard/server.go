@@ -45,6 +45,25 @@ type SnapshotData struct {
 	ThroughputPM  float64       `json:"throughput_per_min"`
 	ScrapeAgeSecs float64       `json:"scrape_age_secs"`
 	Stale         bool          `json:"stale"`
+	PaymentLog    LogPanel      `json:"payment_log"`
+	Gateway       GatewayPanel  `json:"gateway"`
+}
+
+// LogPanel is the payment log state sent to the dashboard.
+type LogPanel struct {
+	Appends           int64 `json:"appends"`
+	SizeBytes         int64 `json:"size_bytes"`
+	IdempotencyHits   int64 `json:"idempotency_hits"`
+	IdempotencyMisses int64 `json:"idempotency_misses"`
+	TwoPCPrepared     int64 `json:"two_pc_prepared"`
+	TwoPCCommitted    int64 `json:"two_pc_committed"`
+	TwoPCRolledBack   int64 `json:"two_pc_rolledback"`
+	Reachable         bool  `json:"reachable"`
+}
+
+// GatewayPanel is the API gateway state.
+type GatewayPanel struct {
+	Reachable bool `json:"reachable"`
 }
 
 // CoordPanel is the coordinator state sent to the dashboard.
@@ -244,6 +263,19 @@ func (s *Server) buildSnapshotData(snap scraper.ClusterSnapshot) SnapshotData {
 		ThroughputPM:  throughputPM,
 		ScrapeAgeSecs: scrapeAge,
 		Stale:         scrapeAge > 30,
+		PaymentLog: LogPanel{
+			Appends:           snap.PaymentLog.LogAppendTotal,
+			SizeBytes:         snap.PaymentLog.LogSizeBytes,
+			IdempotencyHits:   snap.PaymentLog.IdempotencyHits,
+			IdempotencyMisses: snap.PaymentLog.IdempotencyMisses,
+			TwoPCPrepared:     snap.PaymentLog.TwoPCPrepared,
+			TwoPCCommitted:    snap.PaymentLog.TwoPCCommitted,
+			TwoPCRolledBack:   snap.PaymentLog.TwoPCRolledBack,
+			Reachable:         snap.PaymentLog.Reachable,
+		},
+		Gateway: GatewayPanel{
+			Reachable: snap.Gateway.Reachable,
+		},
 	}
 }
 

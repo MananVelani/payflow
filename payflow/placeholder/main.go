@@ -22,6 +22,7 @@ func main() {
 	mainMux := http.NewServeMux()
 	mainMux.HandleFunc("/health", handleHealth)
 	mainMux.HandleFunc("/metrics", handleMetricsStub)
+	mainMux.HandleFunc("/charge", handlePaymentStub)
 	mainMux.HandleFunc("/v1/payments", handlePaymentStub)
 
 	mainServer := &http.Server{
@@ -101,7 +102,7 @@ func handlePaymentStub(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	resp := map[string]string{
 		"txn_id": "stub-001",
-		"status": "queued",
+		"status": "SUCCESS",
 	}
 	json.NewEncoder(w).Encode(resp)
 }

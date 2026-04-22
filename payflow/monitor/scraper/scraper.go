@@ -58,6 +58,9 @@ type PaymentLogState struct {
 	LogSizeBytes      int64     `json:"log_size_bytes"`
 	IdempotencyHits   int64     `json:"idempotency_hits"`
 	IdempotencyMisses int64     `json:"idempotency_misses"`
+	TwoPCPrepared     int64     `json:"two_pc_prepared"`
+	TwoPCCommitted    int64     `json:"two_pc_committed"`
+	TwoPCRolledBack   int64     `json:"two_pc_rolledback"`
 	Reachable         bool      `json:"reachable"`
 	LastSeen          time.Time `json:"last_seen"`
 }
@@ -473,11 +476,11 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			cs.LastSeen = now
 			s.prevCoordinatorSeen[t.Name] = now
 
-			cs.IsLeader = getMetricVal(m, "payflow_is_leader") == 1
-			cs.Epoch = int64(getMetricVal(m, "payflow_current_epoch"))
-			cs.ElectionCount = int64(getMetricVal(m, "payflow_election_count_total"))
-			cs.QueueDepth = int64(getMetricVal(m, "payflow_task_queue_depth"))
-			cs.WorkerCount = int64(getMetricVal(m, "payflow_worker_count"))
+			cs.IsLeader = getMetricVal(m, "payflow_coordinator_is_leader") == 1
+			cs.Epoch = int64(getMetricVal(m, "payflow_coordinator_epoch"))
+			cs.ElectionCount = int64(getMetricVal(m, "payflow_coordinator_elections_total"))
+			cs.QueueDepth = int64(getMetricVal(m, "payflow_coordinator_queue_depth"))
+			cs.WorkerCount = int64(getMetricVal(m, "payflow_coordinator_live_workers"))
 
 			// Sum heartbeat misses across all worker labels
 			cs.HeartbeatMisses = 0
@@ -527,9 +530,9 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			ws.LastSeen = now
 			s.prevWorkerSeen[t.Name] = now
 
-			ws.Alive = getMetricVal(m, "payflow_worker_status") == 1
-			ws.TasksProcessed = int64(getMetricVal(m, "payflow_tasks_processed_total"))
-			ws.TasksFailed = int64(getMetricVal(m, "payflow_tasks_failed_total"))
+			ws.Alive = true // If reachable, assume alive
+			ws.TasksProcessed = int64(getMetricVal(m, "worker_tasks_total"))
+			ws.TasksFailed = int64(getMetricVal(m, "worker_tasks_total", "status=\"error\""))
 			ws.LatencyP50Ms = calcPercentile(m, 0.50)
 			ws.LatencyP99Ms = calcPercentile(m, 0.99)
 		} else if prev, ok := s.prevWorkerSeen[t.Name]; ok {
@@ -555,6 +558,9 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 			snap.PaymentLog.LogSizeBytes = int64(getMetricVal(m, "payflow_log_size_bytes"))
 			snap.PaymentLog.IdempotencyHits = int64(getMetricVal(m, "payflow_idempotency_hit_total"))
 			snap.PaymentLog.IdempotencyMisses = int64(getMetricVal(m, "payflow_idempotency_miss_total"))
+			snap.PaymentLog.TwoPCPrepared = int64(getMetricVal(m, "payflow_2pc_prepared_total"))
+			snap.PaymentLog.TwoPCCommitted = int64(getMetricVal(m, "payflow_2pc_committed_total"))
+			snap.PaymentLog.TwoPCRolledBack = int64(getMetricVal(m, "payflow_2pc_rolledback_total"))
 		}
 	}
 
@@ -575,12 +581,24 @@ func (s *Scraper) buildSnapshot(raw map[string]map[string]float64, reachable map
 	return snap
 }
 
-// getMetricVal looks up a metric value by exact name, returning 0 if not found.
-func getMetricVal(m map[string]float64, name string) float64 {
-	if v, ok := m[name]; ok {
-		return v
+// getMetricVal looks up a metric value by prefix and optional substring.
+func getMetricVal(m map[string]float64, prefix string, contains ...string) float64 {
+	sum := 0.0
+	for k, v := range m {
+		if strings.HasPrefix(k, prefix) {
+			match := true
+			for _, c := range contains {
+				if !strings.Contains(k, c) {
+					match = false
+					break
+				}
+			}
+			if match {
+				sum += v
+			}
+		}
 	}
-	return 0
+	return sum
 }
 
 // bucketEntry represents one bucket in a Prometheus histogram.
